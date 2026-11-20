@@ -753,8 +753,8 @@ local startupOK, startupError = xpcall(function()
     sharedState.cleanup = cleanup
     context.cleanup = cleanup
     local window = Rayfield:CreateWindow({
-        Name = "Rivals Sandbox | Hub", LoadingTitle = "Sandbox Hub",
-        LoadingSubtitle = "Rayfield", Theme = "Ocean", ShowText = "Sandbox Hub",
+        Name = "Jew Hub", LoadingTitle = "Jew Hub",
+        LoadingSubtitle = "Rayfield", Theme = "Ocean", ShowText = "Jew Hub",
         ToggleUIKeybind = "K", ConfigurationSaving = { Enabled = false },
         Discord = { Enabled = false }, KeySystem = false,
     })
