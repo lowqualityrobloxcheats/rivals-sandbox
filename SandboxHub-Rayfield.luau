@@ -1,3 +1,343 @@
+local function validateRageConfig(saved)
+    assert(type(saved) == "table", "Ragebot settings are missing.")
+    local result = {}
+    for _, key in { "enabled", "holdV", "teamCheck", "wallCheck", "autoSwitch", "autoReload", "snapCamera" } do
+        assert(type(saved[key]) == "boolean", "Invalid ragebot setting: " .. key)
+        result[key] = saved[key]
+    end
+    for key, bounds in { range = { 10, 2000 }, intervalMs = { 20, 1000 } } do
+        local value = saved[key]
+        assert(type(value) == "number" and value == value and value >= bounds[1]
+            and value <= bounds[2], "Invalid ragebot setting: " .. key)
+        result[key] = value
+    end
+    assert(saved.part == "Head" or saved.part == "Body" or saved.part == "Random", "Invalid ragebot hit part.")
+    assert(saved.priority == "Distance" or saved.priority == "Health", "Invalid ragebot target priority.")
+    assert(saved.preferred == "Primary" or saved.preferred == "Secondary", "Invalid preferred weapon.")
+    result.part, result.priority, result.preferred = saved.part, saved.priority, saved.preferred
+    return result
+end
+
+local function installRagebot(window, Rayfield, player)
+    local RS = game:GetService("ReplicatedStorage")
+    local Players = game:GetService("Players")
+    local RunService = game:GetService("RunService")
+    local Input = game:GetService("UserInputService")
+    local state = { enabled = false, holdV = false, teamCheck = true, wallCheck = true,
+        autoSwitch = true, autoReload = true, snapCamera = false, range = 2000,
+        intervalMs = 100, part = "Head", priority = "Distance", preferred = "Primary" }
+    local tab = window:CreateTab("Ragebot", 4483362458)
+    local label = tab:CreateLabel("Loading weapon controller…")
+    local widgets, connections, patches = {}, {}, {}
+    local alive, ready = true, false
+    local targetPlayer, targetPart, shootingItem
+    local fighterController, mechanics
+    local lastFire, lastEquip, lastReload = -math.huge, -math.huge, -math.huge
+    local now = os.clock
+    local renderName = "JewHubRage_" .. game:GetService("HttpService"):GenerateGUID(false)
+    local message, lastLabel, sinceLabel = "Off", nil, 0
+    local function clearTarget()
+        targetPlayer, targetPart = nil, nil
+    end
+    local function finishShooting()
+        if shootingItem and mechanics then
+            pcall(function() mechanics:EquippedItemInput("FinishShooting") end)
+        end
+        shootingItem = nil
+    end
+    local function pause(text)
+        clearTarget()
+        finishShooting()
+        message = text
+    end
+    local function cleanup()
+        if not alive then return end
+        alive = false
+        pause("Unloaded")
+        RunService:UnbindFromRenderStep(renderName)
+        for _, connection in connections do connection:Disconnect() end
+        for index = #patches, 1, -1 do
+            local patch = patches[index]
+            if patch.module[patch.key] == patch.wrapper then patch.module[patch.key] = patch.original end
+        end
+    end
+    local function toggle(name, key)
+        widgets[key] = tab:CreateToggle({ Name = name, CurrentValue = state[key], Flag = "RB_" .. key,
+            Callback = function(value)
+                state[key] = value
+                clearTarget()
+                if key == "enabled" and not value then pause("Off") end
+                if key == "enabled" and value and not ready then
+                    Rayfield:Notify({ Title = "Ragebot", Content = "Read the weapon-controller status in this tab.", Duration = 6 })
+                end
+            end })
+    end
+    local function dropdown(name, key, options)
+        widgets[key] = tab:CreateDropdown({ Name = name, Options = options, CurrentOption = { state[key] },
+            MultipleOptions = false, Flag = "RB_" .. key, Callback = function(value)
+                state[key] = type(value) == "table" and value[1] or value
+                clearTarget()
+            end })
+    end
+    toggle("Enable ragebot (RightAlt toggles)", "enabled")
+    toggle("Only while holding V", "holdV")
+    dropdown("Target part", "part", { "Head", "Body", "Random" })
+    dropdown("Target priority", "priority", { "Distance", "Health" })
+    dropdown("Preferred gun", "preferred", { "Primary", "Secondary" })
+    toggle("Switch guns when empty", "autoSwitch")
+    toggle("Auto reload", "autoReload")
+    toggle("Ignore teammates / allies", "teamCheck")
+    toggle("Check line of sight", "wallCheck")
+    toggle("Snap camera to target", "snapCamera")
+    widgets.range = tab:CreateSlider({ Name = "Maximum target distance", Range = { 10, 2000 },
+        Increment = 10, Suffix = "studs", CurrentValue = state.range, Flag = "RB_range",
+        Callback = function(value) state.range = value end })
+    widgets.intervalMs = tab:CreateSlider({ Name = "Minimum firing interval", Range = { 20, 1000 },
+        Increment = 10, Suffix = "ms", CurrentValue = state.intervalMs, Flag = "RB_interval",
+        Callback = function(value) state.intervalMs = value end })
+    tab:CreateLabel("Targets in all directions. Firing follows the equipped gun's cooldown. RightAlt toggles; V hold is optional.")
+
+    local function path(root, names)
+        for _, name in names do
+            root = root:FindFirstChild(name)
+            if not root then error("Missing ragebot module: " .. table.concat(names, ".")) end
+        end
+        return root
+    end
+    local loaded, failure = pcall(function()
+        fighterController = require(path(player.PlayerScripts, { "Controllers", "FighterController" }))
+        mechanics = require(path(player.PlayerScripts, { "Controllers", "MechanicsController" }))
+        local utility = require(path(RS, { "Modules", "Utility" }))
+        local gun = require(path(player.PlayerScripts, { "Modules", "ItemTypes", "Gun" }))
+        assert(type(mechanics.EquippedItemInput) == "function", "MechanicsController.EquippedItemInput is missing.")
+        assert(type(gun.StartShooting) == "function", "Gun.StartShooting is missing.")
+        assert(type(utility.EncodeCFrame) == "function", "Utility.EncodeCFrame is missing.")
+        local function getRoot(character)
+            return character and (character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("HRP"))
+        end
+        local function getPart(character)
+            local names = state.part == "Body" and { "UpperTorso", "Torso", "HumanoidRootPart", "HRP" }
+                or { "PhysicalHitboxHead", "HitboxHead", "HitboxHeadSmall", "Head" }
+            for _, name in names do
+                local part = character:FindFirstChild(name, true)
+                if part and part:IsA("BasePart") then return part end
+            end
+        end
+        local function fighterFor(other)
+            if type(fighterController.GetFighter) == "function" then
+                local fighter = fighterController:GetFighter(other)
+                if fighter then return fighter end
+            end
+            if other == player then return fighterController.LocalFighter end
+        end
+        local function immune(other, character)
+            if character:FindFirstChildOfClass("ForceField") then return true end
+            local fighter = fighterFor(other)
+            local data = fighter and (fighter.Data or (fighter.Entity and fighter.Entity.Data))
+            return data and data.IsInvincible == true
+        end
+        local function isEnemy(other)
+            if other == player then return false end
+            if not state.teamCheck then return true end
+            if not player.Neutral and not other.Neutral and player.Team and player.Team == other.Team then return false end
+            return not (other.Character and other.Character:GetAttribute("IsAlly") == true)
+        end
+        local function candidate(other, origin, params)
+            if not isEnemy(other) then return end
+            local character = other.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            if not humanoid or humanoid.Health <= 0 or immune(other, character) then return end
+            local root, part = getRoot(character), getPart(character)
+            if not root or not part then return end
+            local distance = (root.Position - origin).Magnitude
+            if distance > state.range or (part.Position - origin).Magnitude < 0.01 then return end
+            if state.wallCheck then
+                local hit = workspace:Raycast(origin, part.Position - origin, params)
+                if hit and not hit.Instance:IsDescendantOf(character) then return end
+            end
+            return part, state.priority == "Health" and humanoid.Health or distance, distance
+        end
+        local function chooseTarget(root)
+            local params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            local excluded = { player.Character }
+            if workspace.CurrentCamera then table.insert(excluded, workspace.CurrentCamera) end
+            params.FilterDescendantsInstances = excluded
+            local bestPlayer, bestPart, bestScore, bestDistance = nil, nil, math.huge, math.huge
+            for _, other in Players:GetPlayers() do
+                local part, score, distance = candidate(other, root.Position, params)
+                if part and (score < bestScore or (score == bestScore and distance < bestDistance)) then
+                    bestPlayer, bestPart, bestScore, bestDistance = other, part, score, distance
+                end
+            end
+            return bestPlayer, bestPart
+        end
+        local function ammo(item, key)
+            if not item or type(item.Get) ~= "function" then return end
+            local value = item:Get(key)
+            return type(value) == "number" and value or nil
+        end
+        local function available(item)
+            if not item then return false end
+            local count = ammo(item, "Ammo")
+            return count == nil or count > 0 or (ammo(item, "AmmoReserve") or 0) > 0
+        end
+        local function equipGun(fighter, time)
+            local preferred = state.preferred == "Secondary" and 2 or 1
+            local items = fighter.Items or {}
+            local desiredSlot = preferred
+            local desired = items[preferred]
+            local alternate = items[preferred == 1 and 2 or 1]
+            if state.autoSwitch and alternate then
+                local empty = desired and ammo(desired, "Ammo") == 0
+                local alternateLoaded = (ammo(alternate, "Ammo") or 0) > 0
+                if not available(desired) or (empty and alternateLoaded) then
+                    desiredSlot, desired = preferred == 1 and 2 or 1, alternate
+                end
+            end
+            if not desired then return nil, "No primary/secondary gun found" end
+            if fighter.EquippedItem ~= desired then
+                finishShooting()
+                if time - lastEquip >= 0.25 then
+                    assert(type(fighter.EquipItem) == "function", "Local fighter EquipItem is missing.")
+                    fighter:EquipItem(desiredSlot)
+                    lastEquip = time
+                end
+                return nil, "Equipping " .. tostring(desired.Name or desiredSlot)
+            end
+            return desired
+        end
+        local function buildPayload(root, part)
+            local origin = root.Position
+            local cf = part.CFrame
+            return {
+                [utf8.char(0)] = utility:EncodeCFrame(CFrame.lookAt(origin, part.Position)),
+                [utf8.char(1)] = utility:EncodeCFrame(cf),
+                [utf8.char(2)] = part,
+                [utf8.char(3)] = utility:EncodeCFrame(cf:ToObjectSpace(CFrame.new(part.Position))),
+            }
+        end
+        local original = gun.StartShooting
+        local wrapper = function(self, ...)
+            local result = table.pack(original(self, ...))
+            if not alive or not ready or not state.enabled or not targetPart or not shootingItem
+                or self ~= shootingItem or result[1] ~= true or result[2] ~= "StartShooting" then
+                return table.unpack(result, 1, result.n)
+            end
+            local root = getRoot(player.Character)
+            if root and targetPart.Parent then
+                local part = targetPart
+                if state.part == "Random" and math.random(0, 1) == 0 then
+                    local character = targetPlayer and targetPlayer.Character
+                    part = character and (character:FindFirstChild("UpperTorso", true)
+                        or character:FindFirstChild("Torso", true) or getRoot(character)) or part
+                end
+                result[3] = buildPayload(root, part)
+                result.n = math.max(result.n, 3)
+            end
+            return table.unpack(result, 1, result.n)
+        end
+        table.insert(patches, { module = gun, key = "StartShooting", original = original, wrapper = wrapper })
+        gun.StartShooting = wrapper
+        local function step(dt)
+            if not state.enabled then pause("Off") return end
+            if Input:GetFocusedTextBox() then pause("Paused: text input focused") return end
+            if state.holdV and not Input:IsKeyDown(Enum.KeyCode.V) then pause("Hold V to run") return end
+            local character = player.Character
+            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+            local root = getRoot(character)
+            if not root or not humanoid or humanoid.Health <= 0 then pause("Waiting for your character") return end
+            local fighter = fighterFor(player)
+            if not fighter then pause("Waiting for local fighter") return end
+            targetPlayer, targetPart = chooseTarget(root)
+            if not targetPart then pause("No eligible target") return end
+            local time = now()
+            local item, itemStatus = equipGun(fighter, time)
+            if not item then clearTarget() message = itemStatus return end
+            if ammo(item, "Ammo") == 0 then
+                finishShooting()
+                if state.autoReload and (ammo(item, "AmmoReserve") or 0) > 0 then
+                    if time - lastReload >= 0.75 then
+                        mechanics:EquippedItemInput("StartReloading")
+                        lastReload = time
+                    end
+                    message = "Reloading " .. tostring(item.Name or "gun")
+                else message = "Equipped gun is empty" end
+                clearTarget()
+                return
+            end
+            local weaponCooldown = item.Info and item.Info.ShootCooldown
+            weaponCooldown = type(weaponCooldown) == "number" and weaponCooldown or 0
+            local interval = math.max(state.intervalMs / 1000, weaponCooldown, 0.02)
+            message = "Target: " .. targetPlayer.Name .. " | gun: " .. tostring(item.Name or "equipped")
+            if time - lastFire < interval then return end
+            finishShooting()
+            shootingItem = item
+            lastFire = time
+            mechanics:EquippedItemInput("StartShooting")
+        end
+        ready = true
+        message = "Off | RightAlt toggles ragebot"
+        local busy = false
+        table.insert(connections, RunService.Heartbeat:Connect(function(dt)
+            if not alive or busy then return end
+            busy = true
+            local ok, reason = pcall(step, dt)
+            busy = false
+            if not ok then
+                state.enabled = false
+                pause("Ragebot error: " .. tostring(reason))
+                widgets.enabled:Set(false)
+                message = "Ragebot error: " .. tostring(reason)
+                warn(message)
+            end
+            sinceLabel += dt
+            if sinceLabel >= 0.15 and message ~= lastLabel then
+                sinceLabel, lastLabel = 0, message
+                label:Set(message)
+            end
+        end))
+        RunService:BindToRenderStep(renderName, Enum.RenderPriority.Last.Value + 3, function()
+            if alive and ready and state.enabled and state.snapCamera and targetPart and targetPart.Parent then
+                local camera = workspace.CurrentCamera
+                if camera and (targetPart.Position - camera.CFrame.Position).Magnitude > 0.01 then
+                    camera.CFrame = CFrame.lookAt(camera.CFrame.Position, targetPart.Position)
+                end
+            end
+        end)
+    end)
+    if not loaded then
+        cleanup()
+        label:Set("Unavailable: " .. tostring(failure))
+        Rayfield:Notify({ Title = "Ragebot", Content = tostring(failure), Duration = 8 })
+        return cleanup, nil
+    end
+    label:Set(message)
+    table.insert(connections, Input.InputBegan:Connect(function(input, processed)
+        if not processed and not Input:GetFocusedTextBox() and input.KeyCode == Enum.KeyCode.RightAlt then
+            widgets.enabled:Set(not state.enabled)
+        end
+    end))
+    local api = {}
+    function api:isActive() return alive and ready and state.enabled and targetPart ~= nil end
+    function api:hasShotOverride() return self:isActive() and shootingItem ~= nil end
+    function api:export() return validateRageConfig(state) end
+    function api:prepare(saved)
+        local normalized = validateRageConfig(saved)
+        return function()
+            widgets.enabled:Set(false)
+            for key, value in pairs(normalized) do
+                if key ~= "enabled" then
+                    local dropdownValue = key == "part" or key == "priority" or key == "preferred"
+                    widgets[key]:Set(dropdownValue and { value } or value)
+                end
+            end
+            widgets.enabled:Set(normalized.enabled)
+        end
+    end
+    return cleanup, api
+end
+
 local function aimlockAlpha(smoothing, dt)
     -- A larger smoothing value gives a longer response time, independent of FPS.
     return 1 - math.exp(-60 * math.clamp(dt, 0, 0.1) / smoothing)
@@ -31,6 +371,7 @@ local function installVisualAim(window, Rayfield, player)
         wallCheck = true, smoothing = 10, radius = 300, opacity = 25, part = "Head" }
     local widgets, actors, connections = {}, {}, {}
     local alive, lockedPlayer, lastError = true, nil, nil
+    local aimSuppressed
     local binding = "SandboxVisualAim_" .. game:GetService("HttpService"):GenerateGUID(false)
     local gui = Instance.new("ScreenGui")
     gui.Name = "SandboxESP"
@@ -194,7 +535,7 @@ local function installVisualAim(window, Rayfield, player)
         return part, distance
     end
     local function track(camera, dt)
-        if not state.aimlock or Input:GetFocusedTextBox()
+        if (aimSuppressed and aimSuppressed()) or not state.aimlock or Input:GetFocusedTextBox()
             or (state.holdRightMouse and not Input:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)) then
             lockedPlayer = nil
             return
@@ -267,6 +608,7 @@ local function installVisualAim(window, Rayfield, player)
         end
     end)
     local api = {}
+    function api:setAimSuppressed(callback) aimSuppressed = callback end
     function api:export() return validateVisualAimConfig(state) end
     function api:prepare(saved)
         local normalized = validateVisualAimConfig(saved)
@@ -739,9 +1081,11 @@ local startupOK, startupError = xpcall(function()
     local gui
     local skinCleanup, skinConfig
     local visualCleanup, visualConfig
+    local rageCleanup, rageConfig
     local function cleanup()
         if not alive then return end
         alive = false
+        if rageCleanup then rageCleanup() end
         if skinCleanup then skinCleanup() end
         if visualCleanup then visualCleanup() end
         context.active = false
@@ -760,6 +1104,8 @@ local startupOK, startupError = xpcall(function()
     })
     skinCleanup, skinConfig = installSkinChanger(window, Rayfield, player)
     visualCleanup, visualConfig = installVisualAim(window, Rayfield, player)
+    rageCleanup, rageConfig = installRagebot(window, Rayfield, player)
+    visualConfig:setAimSuppressed(function() return rageConfig and rageConfig:isActive() end)
     local tab = window:CreateTab("Silent Aim", 4483362458)
     local status = tab:CreateLabel("Checking weapon modules…")
     local function notify(message)
@@ -893,6 +1239,7 @@ local startupOK, startupError = xpcall(function()
             -- Preserve every argument, including trailing arguments and nil values.
             local args = table.pack(...)
             if args[1] ~= useItem or args[3] ~= startShooting then return end
+            if rageConfig and rageConfig:hasShotOverride() then return end
             if not config.enabled or config.chance <= 0 then return end
             if config.chance < 100 and rng:NextNumber(0, 100) >= config.chance then return end
             local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
@@ -948,7 +1295,7 @@ local startupOK, startupError = xpcall(function()
     })
     local function captureConfig()
         return { aim = validateAimConfig(config), skins = skinConfig and skinConfig:export() or nil,
-            visualAim = visualConfig:export() }
+            visualAim = visualConfig:export(), ragebot = rageConfig and rageConfig:export() or nil }
     end
     local function prepareConfig(saved)
         assert(type(saved) == "table", "Config settings must be a table.")
@@ -960,6 +1307,11 @@ local startupOK, startupError = xpcall(function()
         end
         local commitVisuals
         if saved.visualAim ~= nil then commitVisuals = visualConfig:prepare(saved.visualAim) end
+        local commitRage
+        if saved.ragebot ~= nil then
+            assert(rageConfig, "Cannot load ragebot settings because its controller is unavailable.")
+            commitRage = rageConfig:prepare(saved.ragebot)
+        end
         -- Validation above is complete before any live settings are changed.
         return function()
             aimEnabledWidget:Set(false)
@@ -971,6 +1323,7 @@ local startupOK, startupError = xpcall(function()
             wallWidget:Set(aim.wallCheck)
             if commitSkins then commitSkins() end
             if commitVisuals then commitVisuals() end
+            if commitRage then commitRage() end
             aimEnabledWidget:Set(aim.enabled)
         end
     end
