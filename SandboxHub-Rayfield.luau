@@ -1,3 +1,285 @@
+local function aimlockAlpha(smoothing, dt)
+    -- A larger smoothing value gives a longer response time, independent of FPS.
+    return 1 - math.exp(-60 * math.clamp(dt, 0, 0.1) / smoothing)
+end
+
+local function validateVisualAimConfig(saved)
+    assert(type(saved) == "table", "ESP/aimlock settings are missing.")
+    local normalized = {}
+    for _, key in { "esp", "tracers", "boxes", "fill", "chams", "espTeamCheck",
+        "aimlock", "holdRightMouse", "aimTeamCheck", "wallCheck" } do
+        assert(type(saved[key]) == "boolean", "Invalid ESP/aimlock setting: " .. key)
+        normalized[key] = saved[key]
+    end
+    for key, bounds in { smoothing = { 1, 100 }, radius = { 20, 800 }, opacity = { 0, 100 } } do
+        local value = saved[key]
+        assert(type(value) == "number" and value == value and value >= bounds[1]
+            and value <= bounds[2], "Invalid ESP/aimlock setting: " .. key)
+        normalized[key] = value
+    end
+    assert(saved.part == "Head" or saved.part == "Body", "Invalid aimlock target part.")
+    normalized.part = saved.part
+    return normalized
+end
+
+local function installVisualAim(window, Rayfield, player)
+    local Players = game:GetService("Players")
+    local RunService = game:GetService("RunService")
+    local Input = game:GetService("UserInputService")
+    local state = { esp = false, tracers = false, boxes = true, fill = false, chams = true,
+        espTeamCheck = false, aimlock = false, holdRightMouse = false, aimTeamCheck = false,
+        wallCheck = true, smoothing = 10, radius = 300, opacity = 25, part = "Head" }
+    local widgets, actors, connections = {}, {}, {}
+    local alive, lockedPlayer, lastError = true, nil, nil
+    local binding = "SandboxVisualAim_" .. game:GetService("HttpService"):GenerateGUID(false)
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "SandboxESP"
+    gui.IgnoreGuiInset = true
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 80
+    gui.Parent = player:WaitForChild("PlayerGui")
+    local tint = Color3.fromRGB(90, 200, 255)
+    local tab = window:CreateTab("ESP", 4483362458)
+    local aimTab = window:CreateTab("Aimlock", 4483362458)
+    local status = aimTab:CreateLabel("Enable aimlock to track players. Higher smoothing = slower tracking.")
+    local function toggle(where, name, key)
+        widgets[key] = where:CreateToggle({ Name = name, CurrentValue = state[key], Flag = "VA_" .. key,
+            Callback = function(value)
+                state[key] = value
+                if key == "aimlock" then lockedPlayer = nil end
+            end })
+    end
+    toggle(tab, "Enable ESP", "esp")
+    toggle(tab, "Tracers", "tracers")
+    toggle(tab, "Boxes", "boxes")
+    toggle(tab, "Box fill", "fill")
+    toggle(tab, "Chams (through walls)", "chams")
+    toggle(tab, "Ignore teammates", "espTeamCheck")
+    widgets.opacity = tab:CreateSlider({ Name = "Fill / chams opacity", Range = { 0, 100 }, Increment = 1,
+        Suffix = "%", CurrentValue = state.opacity, Flag = "VA_opacity",
+        Callback = function(value) state.opacity = value end })
+    toggle(aimTab, "Enable aimlock", "aimlock")
+    toggle(aimTab, "Only while holding right mouse", "holdRightMouse")
+    toggle(aimTab, "Ignore teammates", "aimTeamCheck")
+    toggle(aimTab, "Check line of sight", "wallCheck")
+    widgets.smoothing = aimTab:CreateSlider({ Name = "Smoothing (higher = slower)", Range = { 1, 100 },
+        Increment = 1, CurrentValue = state.smoothing, Flag = "VA_smoothing",
+        Callback = function(value) state.smoothing = value end })
+    widgets.radius = aimTab:CreateSlider({ Name = "Aimlock radius", Range = { 20, 800 }, Increment = 10,
+        CurrentValue = state.radius, Suffix = "pixels", Flag = "VA_radius",
+        Callback = function(value) state.radius = value end })
+    widgets.part = aimTab:CreateDropdown({ Name = "Target part", Options = { "Head", "Body" },
+        CurrentOption = { state.part }, MultipleOptions = false, Flag = "VA_part",
+        Callback = function(value)
+            state.part = type(value) == "table" and value[1] or value
+            lockedPlayer = nil
+        end })
+
+    local function opponent(other, teamCheck)
+        return other ~= player and (not teamCheck or player.Neutral or other.Neutral
+            or not player.Team or other.Team ~= player.Team)
+    end
+    local function removeActor(other)
+        local actor = actors[other]
+        if not actor then return end
+        actor.box:Destroy()
+        actor.tracer:Destroy()
+        if actor.highlight then actor.highlight:Destroy() end
+        actors[other] = nil
+        if lockedPlayer == other then lockedPlayer = nil end
+    end
+    local function makeActor(other)
+        local box = Instance.new("Frame")
+        box.Name = "PlayerBox"
+        box.BorderSizePixel = 0
+        box.BackgroundColor3 = tint
+        box.Visible = false
+        box.Parent = gui
+        local outline = Instance.new("UIStroke")
+        outline.Color = tint
+        outline.Thickness = 2
+        outline.Parent = box
+        local tracer = Instance.new("Frame")
+        tracer.Name = "PlayerTracer"
+        tracer.AnchorPoint = Vector2.new(0.5, 0.5)
+        tracer.BorderSizePixel = 0
+        tracer.BackgroundColor3 = tint
+        tracer.Visible = false
+        tracer.Parent = gui
+        local actor = { box = box, outline = outline, tracer = tracer }
+        actors[other] = actor
+        return actor
+    end
+    local function getBounds(camera, character)
+        local cf, size = character:GetBoundingBox()
+        local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+        for _, x in { -1, 1 } do
+            for _, y in { -1, 1 } do
+                for _, z in { -1, 1 } do
+                    local point = camera:WorldToViewportPoint(cf * Vector3.new(size.X * x / 2, size.Y * y / 2, size.Z * z / 2))
+                    -- Skip boxes intersecting the camera plane to avoid huge inverted rectangles.
+                    if point.Z <= 0.05 then return end
+                    minX, minY = math.min(minX, point.X), math.min(minY, point.Y)
+                    maxX, maxY = math.max(maxX, point.X), math.max(maxY, point.Y)
+                end
+            end
+        end
+        local viewport = camera.ViewportSize
+        if maxX < 0 or maxY < 0 or minX > viewport.X or minY > viewport.Y then return end
+        return minX, minY, maxX, maxY
+    end
+    local function drawActor(other, camera)
+        local actor = actors[other] or makeActor(other)
+        actor.box.Visible, actor.tracer.Visible = false, false
+        local character = other.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local show = state.esp and opponent(other, state.espTeamCheck) and character
+            and character.Parent and humanoid and humanoid.Health > 0
+        if actor.character ~= character then
+            if actor.highlight then actor.highlight:Destroy() actor.highlight = nil end
+            actor.character = character
+        end
+        if show and state.chams and not actor.highlight then
+            local highlight = Instance.new("Highlight")
+            highlight.Name = "SandboxCham"
+            highlight.Adornee = character
+            highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            highlight.FillColor, highlight.OutlineColor = tint, tint
+            highlight.OutlineTransparency = 0
+            highlight.Parent = character
+            actor.highlight = highlight
+        end
+        if actor.highlight then
+            actor.highlight.Enabled = not not (show and state.chams)
+            actor.highlight.FillTransparency = 1 - state.opacity / 100
+        end
+        if not show or not (state.boxes or state.fill or state.tracers) then return end
+        local left, top, right, bottom = getBounds(camera, character)
+        if not left then return end
+        actor.box.Position = UDim2.fromOffset(left, top)
+        actor.box.Size = UDim2.fromOffset(math.max(1, right - left), math.max(1, bottom - top))
+        actor.box.BackgroundTransparency = state.fill and (1 - state.opacity / 100) or 1
+        actor.outline.Enabled = state.boxes
+        actor.box.Visible = state.boxes or state.fill
+        if state.tracers then
+            local origin = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y - 5)
+            local destination = Vector2.new((left + right) / 2, bottom)
+            local delta = destination - origin
+            actor.tracer.Position = UDim2.fromOffset((origin.X + destination.X) / 2, (origin.Y + destination.Y) / 2)
+            actor.tracer.Size = UDim2.fromOffset(delta.Magnitude, 2)
+            actor.tracer.Rotation = math.deg(math.atan2(delta.Y, delta.X))
+            actor.tracer.Visible = true
+        end
+    end
+    local function aimPart(other, camera, params)
+        if not other or other.Parent ~= Players or not opponent(other, state.aimTeamCheck) then return end
+        local character = other.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if not humanoid or humanoid.Health <= 0 then return end
+        local part
+        if state.part == "Head" then part = character:FindFirstChild("Head", true)
+        else
+            part = character:FindFirstChild("UpperTorso", true) or character:FindFirstChild("Torso", true)
+                or character:FindFirstChild("HumanoidRootPart", true)
+        end
+        if not part or not part:IsA("BasePart") then return end
+        local point, visible = camera:WorldToViewportPoint(part.Position)
+        if not visible or point.Z <= 0 then return end
+        local distance = (Vector2.new(point.X, point.Y) - camera.ViewportSize / 2).Magnitude
+        if distance > state.radius then return end
+        if state.wallCheck then
+            local result = workspace:Raycast(camera.CFrame.Position, part.Position - camera.CFrame.Position, params)
+            if result and not result.Instance:IsDescendantOf(character) then return end
+        end
+        return part, distance
+    end
+    local function track(camera, dt)
+        if not state.aimlock or Input:GetFocusedTextBox()
+            or (state.holdRightMouse and not Input:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)) then
+            lockedPlayer = nil
+            return
+        end
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local excluded = { camera }
+        if player.Character then table.insert(excluded, player.Character) end
+        params.FilterDescendantsInstances = excluded
+        local part = aimPart(lockedPlayer, camera, params)
+        if not part then
+            lockedPlayer = nil
+            local best = state.radius
+            for _, other in Players:GetPlayers() do
+                local candidate, distance = aimPart(other, camera, params)
+                if candidate and distance <= best then
+                    part, lockedPlayer, best = candidate, other, distance
+                end
+            end
+        end
+        if part then
+            local origin = camera.CFrame.Position
+            if (part.Position - origin).Magnitude > 0.001 then
+                camera.CFrame = camera.CFrame:Lerp(CFrame.lookAt(origin, part.Position), aimlockAlpha(state.smoothing, dt))
+            end
+        end
+    end
+    local function cleanup()
+        if not alive then return end
+        alive = false
+        RunService:UnbindFromRenderStep(binding)
+        for _, connection in connections do connection:Disconnect() end
+        local keys = {}
+        for other in pairs(actors) do table.insert(keys, other) end
+        for _, other in keys do removeActor(other) end
+        gui:Destroy()
+    end
+    table.insert(connections, Players.PlayerRemoving:Connect(removeActor))
+    local statusElapsed = 0
+    RunService:BindToRenderStep(binding, Enum.RenderPriority.Last.Value + 2, function(dt)
+        if not alive then return end
+        local ok, message = pcall(function()
+            local camera = workspace.CurrentCamera
+            if not camera then return end
+            for _, other in Players:GetPlayers() do
+                if other ~= player then drawActor(other, camera) end
+            end
+            track(camera, dt)
+            statusElapsed += dt
+            if statusElapsed >= 0.25 then
+                statusElapsed = 0
+                if lastError then status:Set(lastError)
+                elseif not state.aimlock then status:Set("Aimlock off. Higher smoothing = slower tracking.")
+                elseif lockedPlayer then status:Set("Tracking " .. lockedPlayer.Name .. " | smoothing " .. state.smoothing)
+                elseif state.holdRightMouse and not Input:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+                    status:Set("Hold right mouse to acquire a target.")
+                else status:Set("No target: check radius, team filter, visibility, and living players.") end
+            end
+        end)
+        if not ok then
+            state.esp, state.aimlock = false, false
+            lockedPlayer = nil
+            lastError = "ESP/aimlock error: " .. tostring(message)
+            status:Set(lastError)
+            for _, actor in pairs(actors) do
+                actor.box.Visible, actor.tracer.Visible = false, false
+                if actor.highlight then actor.highlight.Enabled = false end
+            end
+            warn(lastError)
+        end
+    end)
+    local api = {}
+    function api:export() return validateVisualAimConfig(state) end
+    function api:prepare(saved)
+        local normalized = validateVisualAimConfig(saved)
+        return function()
+            for key, value in pairs(normalized) do
+                widgets[key]:Set(key == "part" and { value } or value)
+            end
+            lockedPlayer = nil
+        end
+    end
+    return cleanup, api
+end
+
 local function createNamedConfigStore(options)
     local fs, json = options.fs, options.json
     local scope = tostring(options.gameId) .. "_" .. tostring(options.userId)
@@ -456,10 +738,12 @@ local startupOK, startupError = xpcall(function()
     local alive = true
     local gui
     local skinCleanup, skinConfig
+    local visualCleanup, visualConfig
     local function cleanup()
         if not alive then return end
         alive = false
         if skinCleanup then skinCleanup() end
+        if visualCleanup then visualCleanup() end
         context.active = false
         config.enabled = false
         for _, connection in connections do connection:Disconnect() end
@@ -475,6 +759,7 @@ local startupOK, startupError = xpcall(function()
         Discord = { Enabled = false }, KeySystem = false,
     })
     skinCleanup, skinConfig = installSkinChanger(window, Rayfield, player)
+    visualCleanup, visualConfig = installVisualAim(window, Rayfield, player)
     local tab = window:CreateTab("Silent Aim", 4483362458)
     local status = tab:CreateLabel("Checking weapon modules…")
     local function notify(message)
@@ -662,7 +947,8 @@ local startupOK, startupError = xpcall(function()
             decode = function(value) return http:JSONDecode(value) end },
     })
     local function captureConfig()
-        return { aim = validateAimConfig(config), skins = skinConfig and skinConfig:export() or nil }
+        return { aim = validateAimConfig(config), skins = skinConfig and skinConfig:export() or nil,
+            visualAim = visualConfig:export() }
     end
     local function prepareConfig(saved)
         assert(type(saved) == "table", "Config settings must be a table.")
@@ -672,6 +958,8 @@ local startupOK, startupError = xpcall(function()
             assert(skinConfig, "Cannot load skins because the skin changer is unavailable.")
             commitSkins = skinConfig:prepare(saved.skins)
         end
+        local commitVisuals
+        if saved.visualAim ~= nil then commitVisuals = visualConfig:prepare(saved.visualAim) end
         -- Validation above is complete before any live settings are changed.
         return function()
             aimEnabledWidget:Set(false)
@@ -682,6 +970,7 @@ local startupOK, startupError = xpcall(function()
             teamWidget:Set(aim.teamCheck)
             wallWidget:Set(aim.wallCheck)
             if commitSkins then commitSkins() end
+            if commitVisuals then commitVisuals() end
             aimEnabledWidget:Set(aim.enabled)
         end
     end
