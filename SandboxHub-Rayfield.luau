@@ -1,5 +1,173 @@
--- Also you're a jew
 -- Jew Hub: expanded from the user-supplied reference interfaces.
+-- Connect the existing feature modules to Obsidian controls without changing their config keys.
+local function createObsidianUI(library)
+    local ui={library=library,destroyed=false}
+    local nativeWindow
+    local pages,groups,columns={},{},{}
+    local serial=0
+    local layout={
+        {"Combat","crosshair"},{"Ragebot","swords"},{"Visuals","eye"},
+        {"Player","person-standing"},{"Skins","palette"},{"Settings","settings"},
+    }
+    local routes={
+        ["Silent Aim"]="Combat",Aimlock="Combat",["Combat Extras"]="Combat",["Gun Mods"]="Combat",
+        Ragebot="Ragebot",["Rage Extras"]="Ragebot",Melee="Ragebot",
+        ESP="Visuals",["ESP Extras"]="Visuals",["Target HUD"]="Visuals",Viewmodel="Visuals",World="Visuals",
+        Movement="Player",Camera="Player",["Skin Changer"]="Skins",["Cosmetic Preview"]="Skins",
+        Configs="Settings",Presets="Settings",Session="Settings",["Feature Status"]="Settings",
+    }
+    function ui:Notify(info)
+        if self.destroyed then return end
+        return library:Notify({Title=info.Title or "Jew Hub",Description=info.Content or "",Time=info.Duration or 5})
+    end
+    function ui:IsVisible()return not self.destroyed and library.Toggled==true end
+    function ui:Destroy()
+        if self.destroyed then return end
+        self.destroyed=true
+        if not library.Unloaded then library:Unload() end
+    end
+    function ui:OnUnload(callback)library:OnUnload(callback)end
+    local function identifier(options)
+        serial+=1
+        return options.Flag or ("JH_UI_"..serial)
+    end
+    local function makeGroup(name)
+        if groups[name] then return groups[name] end
+        local pageName=routes[name] or "Settings"
+        columns[pageName]=(columns[pageName] or 0)+1
+        local side=columns[pageName]%2==1 and "Left" or "Right"
+        local native=pages[pageName]:AddGroupbox({Name=name,Side=side})
+        local group={native=native}
+        function group:CreateLabel(text)
+            local label=native:AddLabel(tostring(text),true)
+            return {Set=function(_,value)if not ui.destroyed then label:SetText(tostring(value)) end end}
+        end
+        function group:CreateButton(options)
+            return native:AddButton({Text=options.Name,Func=function()
+                if not ui.destroyed and options.Callback then options.Callback() end
+            end})
+        end
+        local function control(kind,options)
+            local ready,muted=false,false
+            local object
+            local function normalize(value)
+                if kind=="Dropdown" then
+                    if options.MultipleOptions then
+                        local selected={}
+                        for _,choice in options.Options do if value and value[choice] then table.insert(selected,choice) end end
+                        return selected
+                    end
+                    return {type(value)=="table" and value[1] or value}
+                elseif kind=="Slider" then
+                    local increment=options.Increment or 1
+                    local low,high=options.Range[1],options.Range[2]
+                    return math.clamp(low+math.floor((tonumber(value)-low)/increment+0.5)*increment,low,high)
+                elseif kind=="Input" then return tostring(value) end
+                return value==true
+            end
+            local function nativeValue(value)
+                if kind=="Dropdown" then
+                    if options.MultipleOptions then
+                        local selected={}
+                        for _,choice in value or {} do selected[choice]=true end
+                        return selected
+                    end
+                    return type(value)=="table" and value[1] or value
+                end
+                return value
+            end
+            local function changed(value)
+                if not ready or muted or ui.destroyed then return end
+                local normalized=normalize(value)
+                if kind=="Slider" and normalized~=value then
+                    muted=true object:SetValue(normalized) muted=false
+                end
+                if options.Callback then options.Callback(normalized) end
+            end
+            local data={Text=options.Name,Callback=changed}
+            local id=identifier(options)
+            if kind=="Toggle" then
+                data.Default=options.CurrentValue==true
+                object=native:AddToggle(id,data)
+            elseif kind=="Slider" then
+                data.Min,data.Max=options.Range[1],options.Range[2]
+                data.Default=options.CurrentValue or data.Min
+                local increment=options.Increment or 1
+                local decimals=0
+                while increment<1 and decimals<6 do increment*=10 decimals+=1 end
+                data.Rounding=decimals data.Suffix=options.Suffix or ""
+                object=native:AddSlider(id,data)
+            elseif kind=="Dropdown" then
+                data.Values=table.clone(options.Options)
+                data.Multi=options.MultipleOptions==true
+                data.Default=nativeValue(options.CurrentOption)
+                data.Searchable=true data.AllowNull=true
+                object=native:AddDropdown(id,data)
+            elseif kind=="Input" then
+                data.Default=tostring(options.CurrentValue or "")
+                data.Placeholder=options.PlaceholderText or ""
+                data.ClearTextOnFocus=options.RemoveTextAfterFocusLost==true
+                data.Finished=true data.ClearTextOnBlur=false
+                object=native:AddInput(id,data)
+            end
+            ready=true
+            if kind=="Input" and object.Container and object.Container.FocusLost then
+                library:GiveSignal(object.Container.FocusLost:Connect(function(enterPressed)
+                    if not enterPressed and not ui.destroyed then object:SetValue(object.Container.Text) end
+                end))
+            end
+            local proxy={native=object}
+            function proxy:Set(value)
+                if ui.destroyed then return end
+                local normalized
+                if kind=="Dropdown" and options.MultipleOptions then
+                    normalized=value
+                else normalized=normalize(value) end
+                muted=true
+                local ok,reason=pcall(function()object:SetValue(nativeValue(normalized))end)
+                muted=false
+                if not ok then error(reason,0) end
+                if options.Callback then options.Callback(normalized) end
+            end
+            if kind=="Dropdown" then
+                function proxy:Refresh(values)
+                    if ui.destroyed then return end
+                    options.Options=table.clone(values)
+                    muted=true
+                    local ok,reason=pcall(function()object:SetValues(table.clone(values))end)
+                    muted=false
+                    if not ok then error(reason,0) end
+                end
+            end
+            return proxy
+        end
+        for _,kind in {"Toggle","Slider","Dropdown","Input"} do
+            group["Create"..kind]=function(_,options)return control(kind,options)end
+        end
+        groups[name]=group
+        return group
+    end
+    function ui:CreateWindow(options)
+        assert(not nativeWindow,"The hub window already exists")
+        if library.Scheme then
+            library.Scheme.AccentColor=Color3.fromRGB(226,120,152)
+        end
+        nativeWindow=library:CreateWindow({
+            Title=options.Name or "Jew Hub",Footer="Obsidian | K to show / hide",
+            Size=UDim2.fromOffset(900,650),Center=true,AutoShow=true,Resizable=true,
+            GlobalSearch=true,CornerRadius=8,ShowCustomCursor=false,
+            ShowMobileButtons=true,MobileButtonsSide="Right",NotifySide="Right",
+            ToggleKeybind=Enum.KeyCode.K,
+        })
+        for _,entry in layout do pages[entry[1]]=nativeWindow:AddTab(entry[1],entry[2])end
+        local window={}
+        function window:CreateTab(name)return makeGroup(name)end
+        return window
+    end
+    return ui
+end
+
+
 local extraSchema = {
     {"Combat Extras","aimMode","Aimlock activation","Always",{"Always","Hold","Toggle"}},
     {"Combat Extras","aimScope","Aimlock only while scoped",false},
@@ -2471,10 +2639,10 @@ local startupOK, startupError = xpcall(function()
     if sharedState.cleanup then sharedState.cleanup() end
 
     assert(type(loadstring) == "function", "This version needs executor loadstring support; it is not a normal Studio LocalScript.")
-    local source = game:HttpGet("https://sirius.menu/rayfield")
+    local source = game:HttpGet("https://raw.githubusercontent.com/deividcomsono/Obsidian/c8dfe653304d0934ce651e156403e397467cb9a0/Library.lua")
     local chunk, compileError = loadstring(source)
     assert(chunk, compileError)
-    local Rayfield = chunk()
+    local Rayfield = createObsidianUI(chunk())
     local config = { enabled = false, chance = 100, hitPart = "Head", radius = 300,
         showFOV = true, teamCheck = false, wallCheck = true }
     local context = { config = config, active = true, ready = false }
@@ -2501,10 +2669,11 @@ local startupOK, startupError = xpcall(function()
         pcall(function() Rayfield:Destroy() end)
     end
     sharedState.cleanup = cleanup
+    Rayfield:OnUnload(cleanup)
     context.cleanup = cleanup
     local window = Rayfield:CreateWindow({
         Name = "Jew Hub", LoadingTitle = "Jew Hub",
-        LoadingSubtitle = "Rayfield", Theme = "Ocean", ShowText = "Jew Hub",
+        LoadingSubtitle = "Obsidian", Theme = "Ocean", ShowText = "Jew Hub",
         ToggleUIKeybind = "K", ConfigurationSaving = { Enabled = false },
         Discord = { Enabled = false }, KeySystem = false,
     })
