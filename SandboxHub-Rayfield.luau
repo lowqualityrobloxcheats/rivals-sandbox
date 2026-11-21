@@ -149,6 +149,8 @@ local function validateRageConfig(saved)
     end
     result.settleMs=saved.settleMs==nil and 50 or saved.settleMs
     assert(type(result.settleMs)=="number" and result.settleMs==result.settleMs and result.settleMs>=0 and result.settleMs<=250,"Invalid point-blank settling time.")
+    result.holdMs=saved.holdMs==nil and 150 or saved.holdMs
+    assert(type(result.holdMs)=="number" and result.holdMs==result.holdMs and result.holdMs>=0 and result.holdMs<=1000,"Invalid post-attack hold time.")
     result.meleeAttack=saved.meleeAttack==nil and "Light" or saved.meleeAttack
     assert(result.meleeAttack=="Light" or result.meleeAttack=="Heavy","Invalid melee attack mode.")
     for key, bounds in { range = { 10, 2000 }, intervalMs = { 20, 1000 } } do
@@ -170,7 +172,7 @@ local function installRagebot(window, Rayfield, player)
     local RunService = game:GetService("RunService")
     local Input = game:GetService("UserInputService")
     local state = { enabled = false, holdV = false, teamCheck = true, wallCheck = false,
-        pointBlank = true, skipDeflect = true, sticky = true, settleMs = 50, meleeAttack = "Light",
+        pointBlank = true, skipDeflect = true, sticky = true, settleMs = 50, holdMs = 150, meleeAttack = "Light",
         autoSwitch = true, autoReload = true, snapCamera = false, range = 2000,
         intervalMs = 100, part = "Head", priority = "Distance", preferred = "Primary" }
     local tab = window:CreateTab("Ragebot", 4483362458)
@@ -185,7 +187,7 @@ local function installRagebot(window, Rayfield, player)
     local renderName = "JewHubRage_" .. game:GetService("HttpService"):GenerateGUID(false)
     local restoreName = renderName .. "_Restore"
     local steadyName=renderName.."_SteadyCamera"
-    local pendingRestore,pendingAttack
+    local pendingRestore,pendingAttack,pendingRecovery
     local controllerDecision,acceptedMelee= nil,0
     local sentCount = 0
     local message, lastLabel, sinceLabel = "Off", nil, 0
@@ -203,6 +205,7 @@ local function installRagebot(window, Rayfield, player)
         RunService:UnbindFromRenderStep(restoreName)
         RunService:UnbindFromRenderStep(steadyName)
         pendingAttack=nil
+        pendingRecovery=nil
         local saved = pendingRestore
         pendingRestore = nil
         if saved and saved.root.Parent and player.Character == saved.character then
@@ -225,7 +228,7 @@ local function installRagebot(window, Rayfield, player)
         for _, connection in connections do connection:Disconnect() end
         for index = #patches, 1, -1 do
             local patch = patches[index]
-            if patch.module[patch.key] == patch.wrapper then patch.module[patch.key] = patch.original end
+            if patch.module[patch.key] == patch.wrapper then patch.module[patch.key] = patch.ownOriginal end
         end
     end
     local function toggle(name, key)
@@ -259,6 +262,23 @@ local function installRagebot(window, Rayfield, player)
     dropdown("Melee attack", "meleeAttack", { "Light", "Heavy" })
     widgets.settleMs=tab:CreateSlider({Name="Point-blank settling time",Range={0,250},Increment=10,Suffix="ms",CurrentValue=50,Flag="RB_settleMs",
         Callback=function(value)state.settleMs=value end})
+    widgets.holdMs=tab:CreateSlider({Name="Stay near target after attack",Range={0,1000},Increment=10,Suffix="ms",CurrentValue=state.holdMs,Flag="RB_holdMs",
+        Callback=function(value)state.holdMs=value end})
+    tab:CreateButton({Name="Apply Fists / Battle Axe melee preset",Callback=function()
+        widgets.enabled:Set(false)
+        widgets.preferred:Set({"Melee"})
+        widgets.meleeAttack:Set({"Light"})
+        widgets.part:Set({"Body"})
+        widgets.pointBlank:Set(true)
+        widgets.wallCheck:Set(false)
+        widgets.holdV:Set(false)
+        widgets.sticky:Set(true)
+        widgets.settleMs:Set(100)
+        widgets.holdMs:Set(150)
+        widgets.intervalMs:Set(20)
+        widgets.enabled:Set(true)
+        Rayfield:Notify({Title="Melee preset",Content="Melee / Light / Body; Point-blank ON; line of sight OFF. Weapon cooldown still applies. Check the status for accepted or declined inputs.",Duration=8})
+    end})
     toggle("Switch guns when empty", "autoSwitch")
     toggle("Auto reload", "autoReload")
     toggle("Ignore teammates / allies", "teamCheck")
@@ -272,7 +292,7 @@ local function installRagebot(window, Rayfield, player)
         Increment = 10, Suffix = "ms", CurrentValue = state.intervalMs, Flag = "RB_interval",
         Callback = function(value) state.intervalMs = value end })
     tab:CreateLabel("Targets in all directions. Firing follows the equipped gun's cooldown. RightAlt toggles; V hold is optional.")
-    tab:CreateLabel("Point-blank mode chooses a clear nearby position and settles before firing. Melee uses its native controller. Accepted client attacks and sent gun shots are not confirmed hits.")
+    tab:CreateLabel("Point-blank mode chooses a clear nearby position and settles before firing. Melee uses its native controller. Post-attack hold keeps your position through delayed swings. Accepted client attacks and sent gun shots are not confirmed hits.")
 
     local function path(root, names)
         for _, name in names do
@@ -450,11 +470,21 @@ local function installRagebot(window, Rayfield, player)
             end
             return base
         end
+        local attackHookDepth=0
         local function installAttackHook(module,key,action)
             if not module or type(module[key])~="function" then return false end
             local original=module[key]
+            for _,patch in patches do
+                if original==patch.wrapper then return true end
+            end
+            local ownOriginal=rawget(module,key)
             local wrapper=function(self,...)
-                local result=table.pack(original(self,...))
+                attackHookDepth+=1
+                local call=table.pack(pcall(original,self,...))
+                attackHookDepth-=1
+                if not call[1] then error(call[2],0) end
+                local result=table.pack(table.unpack(call,2,call.n))
+                if attackHookDepth>0 then return table.unpack(result,1,result.n) end
                 if not alive or not ready or not state.enabled or self~=shootingItem then
                     return table.unpack(result,1,result.n)
                 end
@@ -470,7 +500,7 @@ local function installRagebot(window, Rayfield, player)
                 end
                 return table.unpack(result,1,result.n)
             end
-            table.insert(patches,{module=module,key=key,original=original,wrapper=wrapper})
+            table.insert(patches,{module=module,key=key,original=original,ownOriginal=ownOriginal,wrapper=wrapper})
             module[key]=wrapper
             return true
         end
@@ -557,10 +587,36 @@ local function installRagebot(window, Rayfield, player)
             end
             lastFire=time
             pendingAttack=nil
-            RunService:BindToRenderStep(restoreName,101,restorePosition)
+            local accepted=not attack.melee or (controllerDecision and controllerDecision.accepted)
+            if accepted and state.holdMs>0 then
+                pendingRecovery={root=attack.root,character=attack.character,cframe=attack.cframe,
+                    untilTime=time+state.holdMs/1000,status=message,other=attack.other}
+            else
+                RunService:BindToRenderStep(restoreName,101,restorePosition)
+            end
+        end
+        local function processRecovery(time)
+            local recovery=pendingRecovery
+            if not state.enabled or Input:GetFocusedTextBox() or (state.holdV and not Input:IsKeyDown(Enum.KeyCode.V))
+                or (featurePack and (featurePack.state.freecam or not featurePack.state.autoShoot)) then pause("Post-attack hold cancelled") return end
+            local humanoid=player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+            if player.Character~=recovery.character or not humanoid or humanoid.Health<=0 then pause("Character changed during attack") return end
+            if (recovery.root.CFrame.Position-recovery.cframe.Position).Magnitude>1 then pause("Position moved after attack; restored") return end
+            if time>=recovery.untilTime then
+                finishShooting()
+                restorePosition()
+                return true
+            end
+            recovery.root.CFrame=recovery.cframe
+            recovery.root.AssemblyLinearVelocity=Vector3.zero
+            recovery.root.AssemblyAngularVelocity=Vector3.zero
+            message=recovery.status..string.format(" | holding %.0f ms",(recovery.untilTime-time)*1000)
         end
         local function step(dt)
             local time=now()
+            if pendingRecovery then
+                if not processRecovery(time) then return end
+            end
             if pendingAttack then processPending(time) return end
             restorePosition()
             if not state.enabled then pause("Off") return end
@@ -579,7 +635,9 @@ local function installRagebot(window, Rayfield, player)
             if not item then clearTarget() message=itemStatus return end
             local isMelee=state.preferred=="Melee"
             local action=isMelee and state.meleeAttack=="Heavy" and "StartAiming" or "StartShooting"
-            if isMelee and ((action=="StartAiming" and not heavyReady) or (action=="StartShooting" and not lightReady)) then
+            local itemHook=false
+            if isMelee then itemHook=installAttackHook(item,action,action) end
+            if isMelee and not itemHook and ((action=="StartAiming" and not heavyReady) or (action=="StartShooting" and not lightReady)) then
                 pause("Melee controller method is unavailable for the selected attack") return
             end
             -- Melee items commonly report Ammo=0: that is not an empty gun.
@@ -649,7 +707,7 @@ local function installRagebot(window, Rayfield, player)
             sinceLabel += dt
             if sinceLabel >= 0.15 and message ~= lastLabel then
                 sinceLabel, lastLabel = 0, message
-                label:Set(message)
+                label:Set(message.." | Point-blank: "..(state.pointBlank and "ON" or "OFF").." | LOS: "..(state.wallCheck and "ON" or "OFF"))
             end
         end))
         RunService:BindToRenderStep(renderName, Enum.RenderPriority.Last.Value + 3, function()
@@ -677,7 +735,9 @@ local function installRagebot(window, Rayfield, player)
     function api:setFeaturePack(value) featurePack=value end
     function api:getTarget() return targetPlayer,targetPart end
     function api:getDiagnostics()
-        return {status=message,sent=sentCount,acceptedMelee=acceptedMelee,settling=pendingAttack~=nil}
+        return {status=message,sent=sentCount,acceptedMelee=acceptedMelee,settling=pendingAttack~=nil,
+            holding=pendingRecovery~=nil,pointBlank=state.pointBlank,wallCheck=state.wallCheck,
+            weapon=shootingItem and shootingItem.Name,meleeAttack=state.meleeAttack,settleMs=state.settleMs,holdMs=state.holdMs}
     end
     function api:isActive() return alive and ready and state.enabled and targetPart ~= nil end
     function api:hasShotOverride() return self:isActive() and (shootingItem ~= nil or pendingAttack~=nil) end
@@ -688,7 +748,7 @@ local function installRagebot(window, Rayfield, player)
             widgets.enabled:Set(false)
             for key, value in pairs(normalized) do
                 if key ~= "enabled" then
-                    local dropdownValue = key == "part" or key == "priority" or key == "preferred"
+                    local dropdownValue = key == "part" or key == "priority" or key == "preferred" or key == "meleeAttack"
                     widgets[key]:Set(dropdownValue and { value } or value)
                 end
             end
