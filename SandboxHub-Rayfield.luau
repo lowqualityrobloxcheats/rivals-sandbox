@@ -3,19 +3,83 @@
 local function createObsidianUI(library)
     local ui={library=library,destroyed=false}
     local nativeWindow
-    local pages,groups,columns={},{},{}
+    local pages,groups,sections={},{},{}
     local serial=0
     local layout={
-        {"Combat","crosshair"},{"Ragebot","swords"},{"Visuals","eye"},
-        {"Player","person-standing"},{"Skins","palette"},{"Settings","settings"},
+        {"Combat","crosshair",{"Aimlock","Silent Aim","Weapons","Fire Assist"}},
+        {"Ragebot","swords",{"Main","Movement","Melee"}},
+        {"Visuals","eye",{"ESP","Effects","Viewmodel"}},
+        {"Player","person-standing",{"Movement","Camera"}},
+        {"Skins","palette",{"Changer","Inventory"}},
+        {"Settings","settings",{"Configs","Automation","Detectors","Session"}},
     }
+    -- Fixed placement avoids moving controls between columns as modules are initialized.
     local routes={
-        ["Silent Aim"]="Combat",Aimlock="Combat",["Combat Extras"]="Combat",["Gun Mods"]="Combat",
-        Ragebot="Ragebot",["Rage Extras"]="Ragebot",Melee="Ragebot",
-        ESP="Visuals",["ESP Extras"]="Visuals",["Target HUD"]="Visuals",Viewmodel="Visuals",World="Visuals",
-        Movement="Player",Camera="Player",["Skin Changer"]="Skins",["Cosmetic Preview"]="Skins",
-        Configs="Settings",Presets="Settings",Session="Settings",["Feature Status"]="Settings",
+        ["Silent Aim"]={"Combat","Silent Aim","Left","Silent aim"},
+        Aimlock={"Combat","Aimlock","Left","Aimlock"},
+        ["Combat Extras"]={"Combat","Fire Assist","Right","Shared target filters"},
+        ["Gun Mods"]={"Combat","Weapons","Left","Weapon handling"},
+        Ragebot={"Ragebot","Main","Left","Ragebot controls"},
+        ["Rage Extras"]={"Ragebot","Movement","Left","Target movement"},
+        Melee={"Ragebot","Melee","Left","Melee tools"},
+        ESP={"Visuals","ESP","Left","ESP appearance"},
+        ["ESP Extras"]={"Visuals","ESP","Right","Labels and filters"},
+        ["Target HUD"]={"Visuals","Effects","Right","Target display"},
+        Viewmodel={"Visuals","Viewmodel","Left","Weapon appearance"},
+        World={"Visuals","Effects","Left","World and feedback"},
+        Movement={"Player","Movement","Left","Character movement"},
+        Camera={"Player","Camera","Left","Camera controls"},
+        ["Skin Changer"]={"Skins","Changer","Left","Cosmetic selection"},
+        ["Cosmetic Preview"]={"Skins","Inventory","Left","Inventory preview"},
+        Configs={"Settings","Configs","Left","Save and load"},
+        Presets={"Settings","Configs","Right","Presets"},
+        Automation={"Settings","Automation","Left","Match automation"},
+        ["Auto Execute"]={"Settings","Automation","Right","Auto execute"},
+        Detectors={"Settings","Detectors","Left","Detection settings"},
+        Session={"Settings","Session","Left","Session tools"},
+        ["Feature Status"]={"Settings","Session","Right","Feature status"},
     }
+    local flagRoutes={
+        EX_rapidFire={"Combat","Weapons","Right","Rapid fire"},
+        EX_rapidMultiplier={"Combat","Weapons","Right","Rapid fire"},
+        EX_automatic={"Combat","Weapons","Right","Rapid fire"},
+        EX_autoShoot={"Ragebot","Main","Right","Firing"},
+    }
+    for _,key in {"aimMode","aimScope","aimReload","aimInstant","aimContinuous","aimTrackWalls","aimPrediction","correctShots"} do
+        flagRoutes["EX_"..key]={"Combat","Aimlock","Right","Activation and tracking"}
+    end
+    for _,key in {"silentMode","silentSticky","silentPriority","silentPrediction","headChance","healthLead","ragePriority"} do
+        flagRoutes["EX_"..key]={"Combat","Silent Aim","Right","Silent aim options"}
+    end
+    for _,key in {"trigger","triggerDelay","flick"} do
+        flagRoutes["EX_"..key]={"Combat","Fire Assist","Left","Trigger and flick"}
+    end
+    for _,key in {"preferred","meleeAttack","autoSwitch","autoReload","interval"} do
+        flagRoutes["RB_"..key]={"Ragebot","Main","Right","Weapons and firing"}
+    end
+    for _,key in {"fly","flySpeed","noclip","antiAim","antiAimMode","spinSpeed"} do
+        flagRoutes["EX_"..key]={"Player","Movement","Right","Flight and rotation"}
+    end
+    for _,key in {"freecam","freeSpeed"} do
+        flagRoutes["EX_"..key]={"Player","Camera","Right","Free camera"}
+    end
+    for _,key in {"autoBan","bans","secondBans","autoVote","maps"} do
+        flagRoutes["EX_"..key]={"Settings","Automation","Right","Voting and bans"}
+    end
+    for _,key in {"modDetector","notifyMods","groupId","minRank","modNames","modFriends"} do
+        flagRoutes["EX_"..key]={"Settings","Detectors","Right","Staff filters"}
+    end
+    local function section(route)
+        local key=table.concat(route,"/")
+        if not sections[key] then
+            sections[key]=pages[route[1]][route[2]]:AddGroupbox({Name=route[4],Side=route[3]})
+        end
+        return sections[key]
+    end
+    function ui:FeatureLocation(name,key)
+        local route=flagRoutes["EX_"..key] or routes[name] or {"Settings","Session","Right",name}
+        return route[1].." → "..route[2].." → "..route[4]
+    end
     function ui:Notify(info)
         if self.destroyed then return end
         return library:Notify({Title=info.Title or "Jew Hub",Description=info.Content or "",Time=info.Duration or 5})
@@ -33,10 +97,8 @@ local function createObsidianUI(library)
     end
     local function makeGroup(name)
         if groups[name] then return groups[name] end
-        local pageName=routes[name] or "Settings"
-        columns[pageName]=(columns[pageName] or 0)+1
-        local side=columns[pageName]%2==1 and "Left" or "Right"
-        local native=pages[pageName]:AddGroupbox({Name=name,Side=side})
+        local route=routes[name] or {"Settings","Session","Right",name}
+        local native=section(route)
         local group={native=native}
         function group:CreateLabel(text)
             local label=native:AddLabel(tostring(text),true)
@@ -48,6 +110,7 @@ local function createObsidianUI(library)
             end})
         end
         local function control(kind,options)
+            local native=section(flagRoutes[options.Flag] or route)
             local ready,muted=false,false
             local object
             local function normalize(value)
@@ -159,7 +222,11 @@ local function createObsidianUI(library)
             ShowMobileButtons=true,MobileButtonsSide="Right",NotifySide="Right",
             ToggleKeybind=Enum.KeyCode.K,
         })
-        for _,entry in layout do pages[entry[1]]=nativeWindow:AddTab(entry[1],entry[2])end
+        for _,entry in layout do
+            local page=nativeWindow:AddTab({Name=entry[1],Icon=entry[2],SubTabs=true})
+            pages[entry[1]]={}
+            for _,name in entry[3] do pages[entry[1]][name]=page:AddSubTab(name)end
+        end
         local window={}
         function window:CreateTab(name)return makeGroup(name)end
         return window
@@ -281,7 +348,9 @@ local extraSchema = {
     {"Detectors","modNames","Staff usernames",""},
     {"Detectors","modFriends","Staff friend account names",""},
     {"Cosmetic Preview","unlockInventory","Preview unlocked client inventory",false},
-    {"Session","resumeTeleport","Reload this hub after teleport",false},
+    {"Auto Execute","autoEachMatch","Auto execute each match",false},
+    {"Auto Execute","matchProfile","Match setup config","match_auto"},
+    {"Auto Execute","resumeTeleport","Auto execute after server teleport",false},
     {"Session","watermark","FPS / ping watermark",true},
 }
 
@@ -459,8 +528,8 @@ local function installRagebot(window, Rayfield, player)
     widgets.intervalMs = tab:CreateSlider({ Name = "Minimum firing interval", Range = { 50, 1000 },
         Increment = 10, Suffix = "ms", CurrentValue = state.intervalMs, Flag = "RB_interval",
         Callback = function(value) state.intervalMs = value end })
-    tab:CreateLabel("Planner revision: separate melee / gun envelopes; one action per update, bounded by the firing interval.")
-    tab:CreateLabel("Your position restores before camera updates. Direct firing does not hold the camera or send native FinishShooting inputs. Legacy settling/hold settings migrate to zero.")
+    tab:CreateLabel("Choose a weapon and target settings. RightAlt toggles ragebot; V is the optional hold key.")
+    tab:CreateLabel("Speed multiplier: Combat → Weapons → Rapid fire.")
 
     local function path(root, names)
         for _, name in names do
@@ -2362,6 +2431,52 @@ local function installFeaturePack(window, Rayfield, player, endpoints)
             override("inventory",data,"WeaponInventory",weapons)
         end
     end
+    local matchWatchAt=0
+    local matchWatch={}
+    local autoStatus
+    local function matchIdentity()
+        local active=api:isInDuel()
+        if active==false then return end
+        local character=player.Character
+        local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+        if not humanoid or humanoid.Health<=0 then return end
+        local function attribute(name)
+            local value=player:GetAttribute(name)
+            if value==nil and character then value=character:GetAttribute(name) end
+            if value==nil or value==false or value==0 or value=="" then return nil end
+            return tostring(value)
+        end
+        local match=attribute("MatchId") or attribute("DuelId") or attribute("MatchUUID")
+        local round=attribute("RoundId") or attribute("RoundNumber")
+        if active~=true and not match and not round then return end
+        return (match or "active").."/"..(round or "round"),character
+    end
+    local function matchAutoExecute(time)
+        if not state.autoEachMatch then
+            matchWatch={}
+            return
+        end
+        local token,character=matchIdentity()
+        if not token then matchWatch={} return end
+        if matchWatch.token==token and matchWatch.character==character then return end
+        if matchWatch.pending~=token or matchWatch.pendingCharacter~=character then
+            matchWatch.pending,matchWatch.pendingCharacter,matchWatch.since=token,character,time
+            return
+        end
+        if time-matchWatch.since<0.25 or not endpoints.loadConfig then return end
+        matchWatch.token,matchWatch.character=token,character
+        local profile=state.matchProfile
+        task.spawn(function()
+            if not alive or not state.autoEachMatch then return end
+            local ok,reason=pcall(endpoints.loadConfig,profile)
+            if not alive then return end
+            if ok then autoStatus:Set("Applied "..profile.." for this match.")
+            else
+                autoStatus:Set("Auto execute could not load "..profile..": "..tostring(reason))
+                problem("Auto execute",reason)
+            end
+        end)
+    end
     local function automation()
         local remotes=RS:FindFirstChild("Remotes")
         local duels=remotes and remotes:FindFirstChild("Duels")
@@ -2492,7 +2607,7 @@ local function installFeaturePack(window, Rayfield, player, endpoints)
             if query=="" then return end
             local matches={}
             for _,entry in extraSchema do
-                if entry[3]:lower():find(query,1,true) or entry[1]:lower():find(query,1,true) then table.insert(matches,entry[1].." → "..entry[3]) end
+                if entry[3]:lower():find(query,1,true) or entry[1]:lower():find(query,1,true) then table.insert(matches,(Rayfield.FeatureLocation and Rayfield:FeatureLocation(entry[1],entry[2]) or entry[1]).." → "..entry[3]) end
                 if #matches>=12 then break end
             end
             notify(#matches>0 and table.concat(matches,"\n") or "No additional setting matched. Base aim, ESP and skin settings have their own tabs.")
@@ -2507,6 +2622,17 @@ local function installFeaturePack(window, Rayfield, player, endpoints)
             assert(best,"No other available server was returned")
             Teleport:TeleportToPlaceInstance(game.PlaceId,best.id,player)
         end) end)
+    end})
+    autoStatus=tabs["Auto Execute"]:CreateLabel("Save a setup once; it can be reapplied automatically each match.")
+    tabs["Auto Execute"]:CreateButton({Name="Enable auto execute with current setup",Callback=function()
+        if not endpoints.autoSetup then problem("Auto execute","Config setup is still initializing") return end
+        local ok,result=pcall(endpoints.autoSetup)
+        if ok then
+            if result==false then
+                autoStatus:Set("Saved match_auto. Same-server matches are enabled; this executor does not support automatic teleport reload.")
+            else autoStatus:Set("Saved match_auto. Auto execute is enabled for matches and server teleports.") end
+            notify("Auto execute setup saved. First launch after opening Roblox still requires your executor's auto-execute support.")
+        else problem("Auto execute",result) end
     end})
     local teleportQueued=environment.__JewHubTeleportQueues[teleportScope]==true
     onChange=function(key)
@@ -2524,8 +2650,10 @@ local function installFeaturePack(window, Rayfield, player, endpoints)
                 end
                 queue(string.format([[if not game:IsLoaded() then game.Loaded:Wait() end
 local path=%q
+local environment=type(getgenv)=="function" and getgenv() or _G
+if environment.__JewHubTeleportQueues then environment.__JewHubTeleportQueues[%q]=nil end
 if type(isfile)=="function" and type(readfile)=="function" and isfile(path) and readfile(path)=="true" then
-loadstring(game:HttpGet("https://raw.githubusercontent.com/lowqualityrobloxcheats/rivals-sandbox/refs/heads/main/SandboxHub-Rayfield.luau"))() end]],teleportFlag))
+loadstring(game:HttpGet("https://raw.githubusercontent.com/lowqualityrobloxcheats/rivals-sandbox/refs/heads/main/SandboxHub-Rayfield.luau"))() end]],teleportFlag,teleportScope))
                 teleportQueued=true
                 environment.__JewHubTeleportQueues[teleportScope]=true
             end
@@ -2578,6 +2706,9 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/lowqualityrobloxcheat
             else hud.Visible=false restoreMovement() end
             safe("Camera",cameraStep,dt,root,camera)
             safe("Viewmodel",viewmodelStep,camera)
+            if time-matchWatchAt>=0.5 then
+                matchWatchAt=time safe("Auto execute",matchAutoExecute,time)
+            end
             if time-statsAt>=0.5 then
                 statsAt=time safe("Lighting",lightingStep) safe("Weapon stats",weaponStats)
             end
@@ -2588,6 +2719,11 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/lowqualityrobloxcheat
         end)
         engineBusy=false
     end)
+    function api:enableAutoExecute()
+        widgets.matchProfile:Set("match_auto")
+        widgets.autoEachMatch:Set(true)
+        widgets.resumeTeleport:Set(true)
+    end
     function api:export() return validateExtras(state) end
     function api:prepare(saved)
         local validated=validateExtras(saved)
@@ -2599,6 +2735,7 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/lowqualityrobloxcheat
         end
     end
     function api:setLoadConfig(callback) endpoints.loadConfig=callback end
+    function api:setAutoSetup(callback) endpoints.autoSetup=callback end
     function api:getWeaponName(other)
         local fo=fighter and fighter.GetFighter and fighter:GetFighter(other)
         local item=fo and fo.EquippedItem
@@ -2927,6 +3064,12 @@ local startupOK, startupError = xpcall(function()
     featureConfig:setLoadConfig(function(name)
         local commit=prepareConfig(configStore:load(name))
         commit()
+    end)
+    featureConfig:setAutoSetup(function()
+        featureConfig:enableAutoExecute()
+        configStore:save("match_auto",captureConfig())
+        configStore:setAutoload("match_auto")
+        return featureConfig:export().resumeTeleport
     end)
     installConfigUI(window, Rayfield, configStore, captureConfig, prepareConfig)
     local initialConfig=captureConfig()
