@@ -1,3 +1,4 @@
+-- Also you're a jew
 -- Jew Hub: expanded from the user-supplied reference interfaces.
 local extraSchema = {
     {"Combat Extras","aimMode","Aimlock activation","Always",{"Always","Hold","Toggle"}},
