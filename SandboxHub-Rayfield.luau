@@ -143,10 +143,14 @@ local function validateRageConfig(saved)
         result[key] = saved[key]
     end
     -- Profiles saved before point-blank mode keep their original firing behavior.
-    for key, default in pairs({ pointBlank = false, skipDeflect = true }) do
+    for key, default in pairs({ pointBlank = false, skipDeflect = true, sticky = true }) do
         assert(saved[key] == nil or type(saved[key]) == "boolean", "Invalid ragebot setting: " .. key)
         if saved[key] == nil then result[key] = default else result[key] = saved[key] end
     end
+    result.settleMs=saved.settleMs==nil and 50 or saved.settleMs
+    assert(type(result.settleMs)=="number" and result.settleMs==result.settleMs and result.settleMs>=0 and result.settleMs<=250,"Invalid point-blank settling time.")
+    result.meleeAttack=saved.meleeAttack==nil and "Light" or saved.meleeAttack
+    assert(result.meleeAttack=="Light" or result.meleeAttack=="Heavy","Invalid melee attack mode.")
     for key, bounds in { range = { 10, 2000 }, intervalMs = { 20, 1000 } } do
         local value = saved[key]
         assert(type(value) == "number" and value == value and value >= bounds[1]
@@ -166,21 +170,23 @@ local function installRagebot(window, Rayfield, player)
     local RunService = game:GetService("RunService")
     local Input = game:GetService("UserInputService")
     local state = { enabled = false, holdV = false, teamCheck = true, wallCheck = false,
-        pointBlank = true, skipDeflect = true,
+        pointBlank = true, skipDeflect = true, sticky = true, settleMs = 50, meleeAttack = "Light",
         autoSwitch = true, autoReload = true, snapCamera = false, range = 2000,
         intervalMs = 100, part = "Head", priority = "Distance", preferred = "Primary" }
     local tab = window:CreateTab("Ragebot", 4483362458)
     local label = tab:CreateLabel("Loading weapon controller…")
     local widgets, connections, patches = {}, {}, {}
     local alive, ready = true, false
-    local targetPlayer, targetPart, shootingItem
+    local targetPlayer, targetPart, shootingItem, shootingAction
     local fighterController, mechanics
     local featurePack
     local lastFire, lastEquip, lastReload = -math.huge, -math.huge, -math.huge
     local now = os.clock
     local renderName = "JewHubRage_" .. game:GetService("HttpService"):GenerateGUID(false)
     local restoreName = renderName .. "_Restore"
-    local pendingRestore
+    local steadyName=renderName.."_SteadyCamera"
+    local pendingRestore,pendingAttack
+    local controllerDecision,acceptedMelee= nil,0
     local sentCount = 0
     local message, lastLabel, sinceLabel = "Off", nil, 0
     local function clearTarget()
@@ -188,12 +194,15 @@ local function installRagebot(window, Rayfield, player)
     end
     local function finishShooting()
         if shootingItem and mechanics then
-            pcall(function() mechanics:EquippedItemInput("FinishShooting") end)
+            pcall(function() mechanics:EquippedItemInput(shootingAction=="StartAiming" and "FinishAiming" or "FinishShooting") end)
         end
         shootingItem = nil
+        shootingAction=nil
     end
     local function restorePosition()
         RunService:UnbindFromRenderStep(restoreName)
+        RunService:UnbindFromRenderStep(steadyName)
+        pendingAttack=nil
         local saved = pendingRestore
         pendingRestore = nil
         if saved and saved.root.Parent and player.Character == saved.character then
@@ -223,6 +232,7 @@ local function installRagebot(window, Rayfield, player)
         widgets[key] = tab:CreateToggle({ Name = name, CurrentValue = state[key], Flag = "RB_" .. key,
             Callback = function(value)
                 state[key] = value
+                restorePosition()
                 clearTarget()
                 if key == "pointBlank" and not value then restorePosition() end
                 if key == "enabled" and not value then pause("Off") end
@@ -235,15 +245,20 @@ local function installRagebot(window, Rayfield, player)
         widgets[key] = tab:CreateDropdown({ Name = name, Options = options, CurrentOption = { state[key] },
             MultipleOptions = false, Flag = "RB_" .. key, Callback = function(value)
                 state[key] = type(value) == "table" and value[1] or value
+                restorePosition()
                 clearTarget()
             end })
     end
     toggle("Enable ragebot (RightAlt toggles)", "enabled")
     toggle("Only while holding V", "holdV")
     toggle("Point-blank attacks (near-target position)", "pointBlank")
+    toggle("Keep target until invalid", "sticky")
     dropdown("Target part", "part", { "Head", "Body", "Random" })
     dropdown("Target priority", "priority", { "Distance", "Health", "Flagged" })
     dropdown("Preferred weapon slot", "preferred", { "Primary", "Secondary", "Melee" })
+    dropdown("Melee attack", "meleeAttack", { "Light", "Heavy" })
+    widgets.settleMs=tab:CreateSlider({Name="Point-blank settling time",Range={0,250},Increment=10,Suffix="ms",CurrentValue=50,Flag="RB_settleMs",
+        Callback=function(value)state.settleMs=value end})
     toggle("Switch guns when empty", "autoSwitch")
     toggle("Auto reload", "autoReload")
     toggle("Ignore teammates / allies", "teamCheck")
@@ -257,7 +272,7 @@ local function installRagebot(window, Rayfield, player)
         Increment = 10, Suffix = "ms", CurrentValue = state.intervalMs, Flag = "RB_interval",
         Callback = function(value) state.intervalMs = value end })
     tab:CreateLabel("Targets in all directions. Firing follows the equipped gun's cooldown. RightAlt toggles; V hold is optional.")
-    tab:CreateLabel("Point-blank mode temporarily moves your root near the target. Turn line-of-sight checking off for wall targets. Sent shots are not confirmed hits.")
+    tab:CreateLabel("Point-blank mode chooses a clear nearby position and settles before firing. Melee uses its native controller. Accepted client attacks and sent gun shots are not confirmed hits.")
 
     local function path(root, names)
         for _, name in names do
@@ -281,6 +296,15 @@ local function installRagebot(window, Rayfield, player)
             if loadedSpectate then spectate = result end
         end
         local gun = require(path(player.PlayerScripts, { "Modules", "ItemTypes", "Gun" }))
+        local function optionalModule(names)
+            local node=player.PlayerScripts
+            for _,name in names do node=node and node:FindFirstChild(name) end
+            if not node then return end
+            local ok,module=pcall(require,node)
+            if ok and type(module)=="table" then return module end
+        end
+        local melee=optionalModule({"Modules","ItemTypes","Melee"})
+        local knife=optionalModule({"Modules","Items","Knife"})
         assert(type(mechanics.EquippedItemInput) == "function", "MechanicsController.EquippedItemInput is missing.")
         assert(type(gun.StartShooting) == "function", "Gun.StartShooting is missing.")
         assert(type(utility.EncodeCFrame) == "function", "Utility.EncodeCFrame is missing.")
@@ -360,6 +384,10 @@ local function installRagebot(window, Rayfield, player)
             local excluded = { player.Character }
             if workspace.CurrentCamera then table.insert(excluded, workspace.CurrentCamera) end
             params.FilterDescendantsInstances = excluded
+            if state.sticky and targetPlayer and targetPlayer.Parent==Players then
+                local part=candidate(targetPlayer,root.Position,params)
+                if part then return targetPlayer,part end
+            end
             local bestPlayer, bestPart, bestScore, bestDistance = nil, nil, math.huge, math.huge
             for _, other in Players:GetPlayers() do
                 local part, score, distance = candidate(other, root.Position, params)
@@ -405,7 +433,7 @@ local function installRagebot(window, Rayfield, player)
             return desired
         end
         local function buildPayload(root, part)
-            local origin = root.Position
+            local origin = root.CFrame.Position
             local cf = part.CFrame
             return {
                 [utf8.char(0)] = utility:EncodeCFrame(CFrame.lookAt(origin, part.Position)),
@@ -414,100 +442,193 @@ local function installRagebot(window, Rayfield, player)
                 [utf8.char(3)] = utility:EncodeCFrame(cf:ToObjectSpace(CFrame.new(part.Position))),
             }
         end
-        local original = gun.StartShooting
-        local wrapper = function(self, ...)
-            local result = table.pack(original(self, ...))
-            if not alive or not ready or not state.enabled or not targetPart or not shootingItem
-                or self ~= shootingItem or result[1] ~= true or result[2] ~= "StartShooting" then
-                return table.unpack(result, 1, result.n)
+        local function chooseAttackPart(other,base)
+            if state.part~="Random" then return base end
+            local character=other.Character
+            if math.random(0,1)==0 then
+                return character:FindFirstChild("UpperTorso",true) or character:FindFirstChild("Torso",true) or getRoot(character) or base
             end
-            local root = getRoot(player.Character)
-            if root and targetPart.Parent then
-                local part = targetPart
-                if state.part == "Random" and math.random(0, 1) == 0 then
-                    local character = targetPlayer and targetPlayer.Character
-                    part = character and (character:FindFirstChild("UpperTorso", true)
-                        or character:FindFirstChild("Torso", true) or getRoot(character)) or part
-                end
-                result[3] = buildPayload(root, part)
-                result.n = math.max(result.n, 3)
-            end
-            return table.unpack(result, 1, result.n)
+            return base
         end
-        table.insert(patches, { module = gun, key = "StartShooting", original = original, wrapper = wrapper })
-        gun.StartShooting = wrapper
+        local function installAttackHook(module,key,action)
+            if not module or type(module[key])~="function" then return false end
+            local original=module[key]
+            local wrapper=function(self,...)
+                local result=table.pack(original(self,...))
+                if not alive or not ready or not state.enabled or self~=shootingItem then
+                    return table.unpack(result,1,result.n)
+                end
+                local accepted=result[1]==true and result[2]==action
+                controllerDecision={accepted=accepted,reason=tostring(result[2] or "controller declined"),action=action}
+                if not accepted or not targetPart or not targetPart.Parent then return table.unpack(result,1,result.n) end
+                local root=getRoot(player.Character)
+                if root then
+                    local part=pendingAttack and pendingAttack.part or chooseAttackPart(targetPlayer,targetPart)
+                    result[3]=buildPayload(root,part)
+                    result.n=math.max(result.n,3)
+                    if state.preferred=="Melee" then acceptedMelee+=1 end
+                end
+                return table.unpack(result,1,result.n)
+            end
+            table.insert(patches,{module=module,key=key,original=original,wrapper=wrapper})
+            module[key]=wrapper
+            return true
+        end
+        installAttackHook(gun,"StartShooting","StartShooting")
+        local lightReady=installAttackHook(melee,"StartShooting","StartShooting")
+        local heavyReady=installAttackHook(knife,"StartAiming","StartAiming")
+        local function rayParams(other)
+            local params=RaycastParams.new()
+            params.FilterType=Enum.RaycastFilterType.Exclude
+            local excluded={player.Character,other.Character}
+            if workspace.CurrentCamera then table.insert(excluded,workspace.CurrentCamera) end
+            params.FilterDescendantsInstances=excluded
+            params.RespectCanCollide=true
+            params.IgnoreWater=true
+            return params
+        end
+        local function clearSegment(origin,destination,params)
+            return (destination-origin).Magnitude>0.001 and workspace:Raycast(origin,destination-origin,params)==nil
+        end
+        local function chooseOrigin(other,part)
+            local root=getRoot(other.Character)
+            if not root then return end
+            local params=rayParams(other)
+            for _,offset in {Vector3.new(0,1,2),Vector3.new(0,1,-2),Vector3.new(2,1,0),Vector3.new(-2,1,0),Vector3.new(0,3,0)} do
+                local position=(root.CFrame*CFrame.new(offset)).Position
+                if clearSegment(part.Position,position,params) then return CFrame.lookAt(position,part.Position) end
+            end
+        end
+        local function controllerAttack(item,action)
+            finishShooting()
+            shootingItem,shootingAction=item,action
+            controllerDecision=nil
+            mechanics:EquippedItemInput(action)
+            if state.preferred=="Melee" then
+                if controllerDecision and controllerDecision.accepted then
+                    message="Melee controller accepted: "..acceptedMelee.." | target: "..targetPlayer.Name.." (damage unconfirmed)"
+                else
+                    message="Melee controller declined: "..(controllerDecision and controllerDecision.reason or "no matching weapon method dispatched")
+                end
+            end
+        end
+        local function processPending(time)
+            local attack=pendingAttack
+            if not attack then return end
+            if not state.enabled or Input:GetFocusedTextBox() or (state.holdV and not Input:IsKeyDown(Enum.KeyCode.V))
+                or (featurePack and (featurePack.state.freecam or not featurePack.state.autoShoot)) then pause("Point-blank attack cancelled") return end
+            local character=player.Character
+            local h=character and character:FindFirstChildOfClass("Humanoid")
+            local targetCharacter=attack.other.Character
+            local targetHumanoid=targetCharacter and targetCharacter:FindFirstChildOfClass("Humanoid")
+            local lf=fighterFor(player)
+            if character~=attack.character or not h or h.Health<=0 or not targetHumanoid or targetHumanoid.Health<=0
+                or not attack.part.Parent or not isEnemy(attack.other) or immune(attack.other,targetCharacter)
+                or not lf or lf.EquippedItem~=attack.item then pause("Point-blank target / weapon changed") return end
+            if (attack.root.CFrame.Position-attack.cframe.Position).Magnitude>1 then pause("Position moved before firing; attack cancelled") return end
+            if time<attack.fireAt then
+                attack.root.CFrame=attack.cframe
+                attack.root.AssemblyLinearVelocity=Vector3.zero
+                attack.root.AssemblyAngularVelocity=Vector3.zero
+                message="Settling near "..attack.other.Name.." before firing" return
+            end
+            if (attack.part.Position-attack.cframe.Position).Magnitude>8
+                or not clearSegment(attack.cframe.Position,attack.part.Position,rayParams(attack.other)) then
+                pause("Near-target firing position became blocked") return
+            end
+            targetPlayer,targetPart=attack.other,attack.part
+            if attack.melee then
+                controllerAttack(attack.item,attack.action)
+            else
+                finishShooting()
+                shootingItem,shootingAction=attack.item,"StartShooting"
+                local cf=attack.part.CFrame
+                useItem:FireServer(attack.objectID,startShooting,{
+                    [utf8.char(1)]={
+                        [utf8.char(0)]=utility:EncodeCFrame(CFrame.lookAt(attack.cframe.Position,attack.part.Position)),
+                        [utf8.char(1)]=utility:EncodeCFrame(cf),
+                        [utf8.char(2)]=attack.part,
+                        [utf8.char(3)]=utility:EncodeCFrame(cf:ToObjectSpace(CFrame.new(attack.part.Position))),
+                    },
+                },nil)
+                sentCount+=1
+                if featurePack then featurePack:onShot(attack.cframe.Position,attack.part.Position) end
+                message="Near-target UseItem sent: "..sentCount.." | target: "..attack.other.Name.." (hits unconfirmed)"
+            end
+            lastFire=time
+            pendingAttack=nil
+            RunService:BindToRenderStep(restoreName,101,restorePosition)
+        end
         local function step(dt)
-            -- A new heartbeat must never overwrite an outstanding restoration snapshot.
+            local time=now()
+            if pendingAttack then processPending(time) return end
             restorePosition()
             if not state.enabled then pause("Off") return end
             if featurePack and featurePack.state.freecam then pause("Paused: freecam") return end
             if Input:GetFocusedTextBox() then pause("Paused: text input focused") return end
             if state.holdV and not Input:IsKeyDown(Enum.KeyCode.V) then pause("Hold V to run") return end
-            local character = player.Character
-            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-            local root = getRoot(character)
-            if not root or not humanoid or humanoid.Health <= 0 then pause("Waiting for your character") return end
-            local fighter = fighterFor(player)
-            if not fighter then pause("Waiting for local fighter") return end
-            targetPlayer, targetPart = chooseTarget(root)
+            local character=player.Character
+            local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+            local root=getRoot(character)
+            if not root or not humanoid or humanoid.Health<=0 then pause("Waiting for your character") return end
+            local lf=fighterFor(player)
+            if not lf then pause("Waiting for local fighter") return end
+            targetPlayer,targetPart=chooseTarget(root)
             if not targetPart then pause("No eligible target") return end
-            local time = now()
-            local item, itemStatus = equipGun(fighter, time)
-            if not item then clearTarget() message = itemStatus return end
-            if ammo(item, "Ammo") == 0 then
-                finishShooting()
-                if state.autoReload and (ammo(item, "AmmoReserve") or 0) > 0 then
-                    if time - lastReload >= 0.75 then
-                        mechanics:EquippedItemInput("StartReloading")
-                        lastReload = time
-                    end
-                    message = "Reloading " .. tostring(item.Name or "gun")
-                else message = "Equipped gun is empty" end
-                clearTarget()
-                return
+            local item,itemStatus=equipGun(lf,time)
+            if not item then clearTarget() message=itemStatus return end
+            local isMelee=state.preferred=="Melee"
+            local action=isMelee and state.meleeAttack=="Heavy" and "StartAiming" or "StartShooting"
+            if isMelee and ((action=="StartAiming" and not heavyReady) or (action=="StartShooting" and not lightReady)) then
+                pause("Melee controller method is unavailable for the selected attack") return
             end
-            local weaponCooldown = item.Info and item.Info.ShootCooldown
-            weaponCooldown = type(weaponCooldown) == "number" and weaponCooldown or 0
-            local interval = math.max(state.intervalMs / 1000, weaponCooldown, 0.02)
-            message = "Target: " .. targetPlayer.Name .. " | gun: " .. tostring(item.Name or "equipped")
-                .. " | direct shots sent: " .. sentCount
-            if featurePack and not featurePack.state.autoShoot then finishShooting() return end
-            if time - lastFire < interval then return end
-            finishShooting()
-            shootingItem = item
-            lastFire = time
-            if state.pointBlank then
-                local targetRoot = getRoot(targetPlayer.Character)
-                if not targetRoot then pause("Target root missing") return end
-                local part = targetPart
-                if state.part == "Random" and math.random(0, 1) == 0 then
-                    local otherCharacter = targetPlayer.Character
-                    part = otherCharacter:FindFirstChild("UpperTorso", true)
-                        or otherCharacter:FindFirstChild("Torso", true) or targetRoot
+            -- Melee items commonly report Ammo=0: that is not an empty gun.
+            if not isMelee and ammo(item,"Ammo")==0 then
+                finishShooting()
+                if state.autoReload and (ammo(item,"AmmoReserve") or 0)>0 then
+                    if time-lastReload>=0.75 then mechanics:EquippedItemInput("StartReloading") lastReload=time end
+                    message="Reloading "..tostring(item.Name or "gun")
+                else message="Equipped gun is empty" end
+                clearTarget() return
+            end
+            if isMelee and type(item._attack_cooldown)=="number" then
+                local remaining=item._attack_cooldown-tick()
+                if remaining>(state.pointBlank and state.settleMs/1000 or 0) and remaining<30 then
+                    message=string.format("Melee cooldown: %.2fs",remaining) return
                 end
-                local attackPosition = (targetRoot.CFrame * CFrame.new(0, 1, 2)).Position
-                local attackCF = CFrame.lookAt(attackPosition, part.Position)
-                local objectID = item:Get("ObjectID")
-                assert(objectID ~= nil, "Equipped item has no ObjectID.")
-                pendingRestore = { root = root, character = character, cframe = root.CFrame,
-                    velocity = root.AssemblyLinearVelocity, angularVelocity = root.AssemblyAngularVelocity }
-                -- Install restoration before moving or sending, so errors can restore immediately.
-                RunService:BindToRenderStep(restoreName, 101, restorePosition)
-                root.CFrame = attackCF
-                local partCF = part.CFrame
-                useItem:FireServer(objectID, startShooting, {
-                    [utf8.char(1)] = {
-                        [utf8.char(0)] = utility:EncodeCFrame(attackCF),
-                        [utf8.char(1)] = utility:EncodeCFrame(partCF),
-                        [utf8.char(2)] = part,
-                        [utf8.char(3)] = utility:EncodeCFrame(partCF:ToObjectSpace(CFrame.new(part.Position))),
-                    },
-                }, nil)
-                sentCount += 1
-                if featurePack then featurePack:onShot(attackPosition,part.Position) end
-                message = "Near-target UseItem sent: " .. sentCount .. " | target: " .. targetPlayer.Name .. " (hits unconfirmed)"
+            end
+            local weaponCooldown=item.Info and item.Info.ShootCooldown
+            weaponCooldown=type(weaponCooldown)=="number" and weaponCooldown or 0
+            local interval=math.max(state.intervalMs/1000,weaponCooldown,0.02)
+            message="Target: "..targetPlayer.Name.." | weapon: "..tostring(item.Name or "equipped")
+                .." | gun sends: "..sentCount.." | accepted melee: "..acceptedMelee
+            if featurePack and not featurePack.state.autoShoot then finishShooting() return end
+            local lead=state.pointBlank and state.settleMs/1000 or 0
+            if time+lead<lastFire+interval then return end
+            if state.pointBlank then
+                local part=chooseAttackPart(targetPlayer,targetPart)
+                local attackCF=chooseOrigin(targetPlayer,part)
+                if not attackCF then pause("No clear near-target firing position") return end
+                local objectID=item:Get("ObjectID")
+                if not isMelee then assert(objectID~=nil,"Equipped item has no ObjectID.") end
+                finishShooting()
+                pendingRestore={root=root,character=character,cframe=root.CFrame,
+                    velocity=root.AssemblyLinearVelocity,angularVelocity=root.AssemblyAngularVelocity}
+                pendingAttack={root=root,character=character,other=targetPlayer,part=part,item=item,melee=isMelee,
+                    action=action,cframe=attackCF,objectID=objectID,fireAt=math.max(time+state.settleMs/1000,lastFire+interval)}
+                local camera=workspace.CurrentCamera
+                local originalCamera=camera and camera.CFrame
+                RunService:BindToRenderStep(steadyName,Enum.RenderPriority.Last.Value+20,function()
+                    if pendingRestore and not state.snapCamera and camera and workspace.CurrentCamera==camera then camera.CFrame=originalCamera end
+                end)
+                root.CFrame=attackCF
+                root.AssemblyLinearVelocity=Vector3.zero
+                root.AssemblyAngularVelocity=Vector3.zero
+                message="Settling near "..targetPlayer.Name.." before firing"
+                if state.settleMs==0 then processPending(time) end
             else
-                mechanics:EquippedItemInput("StartShooting")
+                controllerAttack(item,action)
+                lastFire=time
             end
         end
         ready = true
@@ -555,8 +676,11 @@ local function installRagebot(window, Rayfield, player)
     local api = {}
     function api:setFeaturePack(value) featurePack=value end
     function api:getTarget() return targetPlayer,targetPart end
+    function api:getDiagnostics()
+        return {status=message,sent=sentCount,acceptedMelee=acceptedMelee,settling=pendingAttack~=nil}
+    end
     function api:isActive() return alive and ready and state.enabled and targetPart ~= nil end
-    function api:hasShotOverride() return self:isActive() and shootingItem ~= nil end
+    function api:hasShotOverride() return self:isActive() and (shootingItem ~= nil or pendingAttack~=nil) end
     function api:export() return validateRageConfig(state) end
     function api:prepare(saved)
         local normalized = validateRageConfig(saved)
