@@ -5,6 +5,11 @@ local function validateRageConfig(saved)
         assert(type(saved[key]) == "boolean", "Invalid ragebot setting: " .. key)
         result[key] = saved[key]
     end
+    -- Profiles saved before point-blank mode keep their original firing behavior.
+    for key, default in pairs({ pointBlank = false, skipDeflect = true }) do
+        assert(saved[key] == nil or type(saved[key]) == "boolean", "Invalid ragebot setting: " .. key)
+        if saved[key] == nil then result[key] = default else result[key] = saved[key] end
+    end
     for key, bounds in { range = { 10, 2000 }, intervalMs = { 20, 1000 } } do
         local value = saved[key]
         assert(type(value) == "number" and value == value and value >= bounds[1]
@@ -23,7 +28,8 @@ local function installRagebot(window, Rayfield, player)
     local Players = game:GetService("Players")
     local RunService = game:GetService("RunService")
     local Input = game:GetService("UserInputService")
-    local state = { enabled = false, holdV = false, teamCheck = true, wallCheck = true,
+    local state = { enabled = false, holdV = false, teamCheck = true, wallCheck = false,
+        pointBlank = true, skipDeflect = true,
         autoSwitch = true, autoReload = true, snapCamera = false, range = 2000,
         intervalMs = 100, part = "Head", priority = "Distance", preferred = "Primary" }
     local tab = window:CreateTab("Ragebot", 4483362458)
@@ -35,6 +41,9 @@ local function installRagebot(window, Rayfield, player)
     local lastFire, lastEquip, lastReload = -math.huge, -math.huge, -math.huge
     local now = os.clock
     local renderName = "JewHubRage_" .. game:GetService("HttpService"):GenerateGUID(false)
+    local restoreName = renderName .. "_Restore"
+    local pendingRestore
+    local sentCount = 0
     local message, lastLabel, sinceLabel = "Off", nil, 0
     local function clearTarget()
         targetPlayer, targetPart = nil, nil
@@ -45,7 +54,18 @@ local function installRagebot(window, Rayfield, player)
         end
         shootingItem = nil
     end
+    local function restorePosition()
+        RunService:UnbindFromRenderStep(restoreName)
+        local saved = pendingRestore
+        pendingRestore = nil
+        if saved and saved.root.Parent and player.Character == saved.character then
+            saved.root.CFrame = saved.cframe
+            saved.root.AssemblyLinearVelocity = saved.velocity
+            saved.root.AssemblyAngularVelocity = saved.angularVelocity
+        end
+    end
     local function pause(text)
+        restorePosition()
         clearTarget()
         finishShooting()
         message = text
@@ -66,6 +86,7 @@ local function installRagebot(window, Rayfield, player)
             Callback = function(value)
                 state[key] = value
                 clearTarget()
+                if key == "pointBlank" and not value then restorePosition() end
                 if key == "enabled" and not value then pause("Off") end
                 if key == "enabled" and value and not ready then
                     Rayfield:Notify({ Title = "Ragebot", Content = "Read the weapon-controller status in this tab.", Duration = 6 })
@@ -81,6 +102,7 @@ local function installRagebot(window, Rayfield, player)
     end
     toggle("Enable ragebot (RightAlt toggles)", "enabled")
     toggle("Only while holding V", "holdV")
+    toggle("Point-blank attacks (near-target position)", "pointBlank")
     dropdown("Target part", "part", { "Head", "Body", "Random" })
     dropdown("Target priority", "priority", { "Distance", "Health" })
     dropdown("Preferred gun", "preferred", { "Primary", "Secondary" })
@@ -88,6 +110,7 @@ local function installRagebot(window, Rayfield, player)
     toggle("Auto reload", "autoReload")
     toggle("Ignore teammates / allies", "teamCheck")
     toggle("Check line of sight", "wallCheck")
+    toggle("Skip deflecting katana", "skipDeflect")
     toggle("Snap camera to target", "snapCamera")
     widgets.range = tab:CreateSlider({ Name = "Maximum target distance", Range = { 10, 2000 },
         Increment = 10, Suffix = "studs", CurrentValue = state.range, Flag = "RB_range",
@@ -96,6 +119,7 @@ local function installRagebot(window, Rayfield, player)
         Increment = 10, Suffix = "ms", CurrentValue = state.intervalMs, Flag = "RB_interval",
         Callback = function(value) state.intervalMs = value end })
     tab:CreateLabel("Targets in all directions. Firing follows the equipped gun's cooldown. RightAlt toggles; V hold is optional.")
+    tab:CreateLabel("Point-blank mode temporarily moves your root near the target. Turn line-of-sight checking off for wall targets. Sent shots are not confirmed hits.")
 
     local function path(root, names)
         for _, name in names do
@@ -108,6 +132,16 @@ local function installRagebot(window, Rayfield, player)
         fighterController = require(path(player.PlayerScripts, { "Controllers", "FighterController" }))
         mechanics = require(path(player.PlayerScripts, { "Controllers", "MechanicsController" }))
         local utility = require(path(RS, { "Modules", "Utility" }))
+        local enums = require(path(RS, { "Modules", "EnumLibrary" }))
+        local useItem = path(RS, { "Remotes", "Replication", "Fighter", "UseItem" })
+        assert(useItem:IsA("RemoteEvent"), "UseItem is not a RemoteEvent.")
+        local startShooting = assert(enums:ToEnum("StartShooting"), "StartShooting enum is missing.")
+        local spectate
+        local spectateModule = player.PlayerScripts.Controllers:FindFirstChild("SpectateController")
+        if spectateModule then
+            local loadedSpectate, result = pcall(require, spectateModule)
+            if loadedSpectate then spectate = result end
+        end
         local gun = require(path(player.PlayerScripts, { "Modules", "ItemTypes", "Gun" }))
         assert(type(mechanics.EquippedItemInput) == "function", "MechanicsController.EquippedItemInput is missing.")
         assert(type(gun.StartShooting) == "function", "Gun.StartShooting is missing.")
@@ -139,6 +173,21 @@ local function installRagebot(window, Rayfield, player)
         local function isEnemy(other)
             if other == player then return false end
             if not state.teamCheck then return true end
+            local duel = spectate and spectate.CurrentDuelSubject
+            if duel and type(duel.GetDueler) == "function" then
+                local dueler = duel:GetDueler(player)
+                local localTeam = dueler and dueler:Get("TeamID")
+                if localTeam ~= nil then
+                    for _, opponent in pairs(duel.Duelers or {}) do
+                        if opponent.Player == other then
+                            local otherTeam = opponent:Get("TeamID")
+                            if otherTeam ~= nil then return localTeam ~= otherTeam end
+                        end
+                    end
+                end
+            end
+            local localTeam, otherTeam = player:GetAttribute("TeamID"), other:GetAttribute("TeamID")
+            if localTeam ~= nil and otherTeam ~= nil then return localTeam ~= otherTeam end
             if not player.Neutral and not other.Neutral and player.Team and player.Team == other.Team then return false end
             return not (other.Character and other.Character:GetAttribute("IsAlly") == true)
         end
@@ -147,6 +196,13 @@ local function installRagebot(window, Rayfield, player)
             local character = other.Character
             local humanoid = character and character:FindFirstChildOfClass("Humanoid")
             if not humanoid or humanoid.Health <= 0 or immune(other, character) then return end
+            if state.skipDeflect then
+                local otherFighter = fighterFor(other)
+                local equipped = otherFighter and otherFighter.EquippedItem
+                local model = equipped and equipped.ViewModel
+                if model and model.Name == "Katana" and type(equipped._attack_cooldown) == "number"
+                    and equipped._attack_cooldown > tick() then return end
+            end
             local root, part = getRoot(character), getPart(character)
             if not root or not part then return end
             local distance = (root.Position - origin).Magnitude
@@ -240,6 +296,8 @@ local function installRagebot(window, Rayfield, player)
         table.insert(patches, { module = gun, key = "StartShooting", original = original, wrapper = wrapper })
         gun.StartShooting = wrapper
         local function step(dt)
+            -- A new heartbeat must never overwrite an outstanding restoration snapshot.
+            restorePosition()
             if not state.enabled then pause("Off") return end
             if Input:GetFocusedTextBox() then pause("Paused: text input focused") return end
             if state.holdV and not Input:IsKeyDown(Enum.KeyCode.V) then pause("Hold V to run") return end
@@ -270,11 +328,43 @@ local function installRagebot(window, Rayfield, player)
             weaponCooldown = type(weaponCooldown) == "number" and weaponCooldown or 0
             local interval = math.max(state.intervalMs / 1000, weaponCooldown, 0.02)
             message = "Target: " .. targetPlayer.Name .. " | gun: " .. tostring(item.Name or "equipped")
+                .. " | direct shots sent: " .. sentCount
             if time - lastFire < interval then return end
             finishShooting()
             shootingItem = item
             lastFire = time
-            mechanics:EquippedItemInput("StartShooting")
+            if state.pointBlank then
+                local targetRoot = getRoot(targetPlayer.Character)
+                if not targetRoot then pause("Target root missing") return end
+                local part = targetPart
+                if state.part == "Random" and math.random(0, 1) == 0 then
+                    local otherCharacter = targetPlayer.Character
+                    part = otherCharacter:FindFirstChild("UpperTorso", true)
+                        or otherCharacter:FindFirstChild("Torso", true) or targetRoot
+                end
+                local attackPosition = (targetRoot.CFrame * CFrame.new(0, 1, 2)).Position
+                local attackCF = CFrame.lookAt(attackPosition, part.Position)
+                local objectID = item:Get("ObjectID")
+                assert(objectID ~= nil, "Equipped item has no ObjectID.")
+                pendingRestore = { root = root, character = character, cframe = root.CFrame,
+                    velocity = root.AssemblyLinearVelocity, angularVelocity = root.AssemblyAngularVelocity }
+                -- Install restoration before moving or sending, so errors can restore immediately.
+                RunService:BindToRenderStep(restoreName, 101, restorePosition)
+                root.CFrame = attackCF
+                local partCF = part.CFrame
+                useItem:FireServer(objectID, startShooting, {
+                    [utf8.char(1)] = {
+                        [utf8.char(0)] = utility:EncodeCFrame(attackCF),
+                        [utf8.char(1)] = utility:EncodeCFrame(partCF),
+                        [utf8.char(2)] = part,
+                        [utf8.char(3)] = utility:EncodeCFrame(partCF:ToObjectSpace(CFrame.new(part.Position))),
+                    },
+                }, nil)
+                sentCount += 1
+                message = "Near-target UseItem sent: " .. sentCount .. " | target: " .. targetPlayer.Name .. " (hits unconfirmed)"
+            else
+                mechanics:EquippedItemInput("StartShooting")
+            end
         end
         ready = true
         message = "Off | RightAlt toggles ragebot"
