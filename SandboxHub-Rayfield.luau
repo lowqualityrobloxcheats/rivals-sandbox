@@ -49,7 +49,8 @@ local extraSchema = {
     {"Gun Mods","noSpread","No spread",false},
     {"Gun Mods","antiShake","Suppress viewmodel recoil shake",false},
     {"Gun Mods","fastReload","Fast reload (client stats)",false},
-    {"Gun Mods","rapidFire","Rapid fire (client stats)",false},
+    {"Gun Mods","rapidFire","Rapid fire",false},
+    {"Gun Mods","rapidMultiplier","Rapid fire speed multiplier",2,1,10,1},
     {"Gun Mods","instantEquip","Instant equip (client stats)",false},
     {"Gun Mods","automatic","Automatic input while holding fire",false},
     {"Gun Mods","infiniteAmmo","Expanded ammo capacity (client stats)",false},
@@ -554,7 +555,8 @@ local function installRagebot(window, Rayfield, player)
             local plan,reason=makePlan(item,targetPlayer,attackPart(targetPlayer,targetPart),root)
             if not plan then message=reason nextAttackAt=time+0.1 return end
             -- No catch-up loop after a slow frame: at most one action is sent per Heartbeat.
-            local interval=math.max(0.05,state.intervalMs/1000)
+            local multiplier=featurePack and featurePack.state.rapidFire and featurePack.state.rapidMultiplier or 1
+            local interval=math.max(0.001,math.max(0.05,state.intervalMs/1000)/multiplier)
             nextAttackAt=time+interval
             executePlan(plan,root)
         end
@@ -1533,6 +1535,7 @@ local function installFeaturePack(window, Rayfield, player, endpoints)
     local Teleport = game:GetService("TeleportService")
     local state = validateExtras({})
     local widgets, tabs, connections, patches, groups = {}, {}, {}, {}, {}
+    local originalStats=setmetatable({}, {__mode="k"})
     local owned=setmetatable({}, {__mode="k"})
     local alive, aimToggle, silentToggle = true, false, true
     local binding = "JewHubFeatures_" .. Http:GenerateGUID(false)
@@ -1736,7 +1739,10 @@ local function installFeaturePack(window, Rayfield, player, endpoints)
     local function cooldown()
         local lf=localFighter()
         local item=lf and lf.EquippedItem
-        return math.max(0.02, item and item.Info and tonumber(item.Info.ShootCooldown) or 0.12)
+        local info=item and item.Info
+        local original=info and originalStats[info]
+        local base=original and original.ShootCooldown or (info and tonumber(info.ShootCooldown)) or 0.12
+        return math.max(0.001,base/(state.rapidFire and state.rapidMultiplier or 1))
     end
     local function restoreMovement()
         for _,name in {"speed","jump","noclip","fly","freecam","thirdPerson"} do restore(name) end
@@ -1832,7 +1838,6 @@ local function installFeaturePack(window, Rayfield, player, endpoints)
             for _,child in Lighting:GetChildren() do if child:IsA("Atmosphere") then override("fog",child,"Density",0) end end
         else restore("fog") end
     end
-    local originalStats=setmetatable({}, {__mode="k"})
     local function weaponStats()
         if not itemLibrary or type(itemLibrary.Items)~="table" then
             if state.noRecoil or state.noSpread or state.fastReload or state.rapidFire or state.instantEquip or state.infiniteAmmo then
@@ -1844,6 +1849,7 @@ local function installFeaturePack(window, Rayfield, player, endpoints)
             ShootSpreadPerVelocityUnit="noSpread",ShootSpreadPerVelocityLimit="noSpread",
             EquipCooldown="instantEquip",ReloadLength="fastReload",EmptyReloadLength="fastReload",
             ReloadActionTimestamp="fastReload",EmptyReloadActionTimestamp="fastReload",ShootCooldown="rapidFire",
+            QuickShotCooldown="rapidFire",BurstCooldown="rapidFire",ShootBurstCooldown="rapidFire",
             MaxAmmo="infiniteAmmo",MaxAmmoReserve="infiniteAmmo"}
         for _,item in pairs(itemLibrary.Items) do
             if type(item)=="table" then
@@ -1854,7 +1860,7 @@ local function installFeaturePack(window, Rayfield, player, endpoints)
                         if original[key]==nil then original[key]=item[key] end
                         local value=original[key]
                         if state[flag] then
-                            if flag=="rapidFire" then value=math.max(0.02,value*0.4)
+                            if flag=="rapidFire" then value=math.max(0.001,value/state.rapidMultiplier)
                             elseif flag=="infiniteAmmo" then value=9999
                             elseif flag=="fastReload" or flag=="instantEquip" then value=0.05
                             else value=0 end
@@ -1865,6 +1871,27 @@ local function installFeaturePack(window, Rayfield, player, endpoints)
             end
         end
     end
+    patch(gun,"StartShooting",function(original)
+        return function(self,...)
+            local lf=localFighter()
+            local owner=self.ClientFighter
+            local isLocal=(lf and lf.EquippedItem==self) or (owner and (owner.Player==player or owner.IsLocalPlayer==true))
+            if not alive or not state.rapidFire or not isLocal or type(self.Info)~="table" then
+                return original(self,...)
+            end
+            local info=self.Info
+            local before=info.ShootCooldown
+            if type(before)~="number" then return original(self,...) end
+            local cached=originalStats[info]
+            local base=cached and cached.ShootCooldown or before
+            local adjusted=math.max(0.001,base/state.rapidMultiplier)
+            info.ShootCooldown=adjusted
+            local result=table.pack(pcall(original,self,...))
+            if info.ShootCooldown==adjusted then info.ShootCooldown=before end
+            if not result[1] then error(result[2],0) end
+            return table.unpack(result,2,result.n)
+        end
+    end)
     local function inputFeatures(time, root, camera)
         if Input:GetFocusedTextBox() or state.freecam or (endpoints.rage and endpoints.rage:isActive()) then return end
         if state.flick and (Input.TouchEnabled or Input:IsKeyDown(Enum.KeyCode.F)) then
@@ -2278,7 +2305,7 @@ local function installFeaturePack(window, Rayfield, player, endpoints)
     end
     tabs["Rage Extras"]:CreateLabel("Point-blank attacks take priority over orbiting and pathfinding. Use current-position attacks for orbit/autoplay.")
     tabs["Combat Extras"]:CreateLabel("Aimlock hold/toggle: RMB or E. Silent hold/toggle: C. Flickbot: hold F.")
-    tabs["Gun Mods"]:CreateLabel("These change local stats and inputs. Server ammo, damage and cooldown checks still apply.")
+    tabs["Gun Mods"]:CreateLabel("Rapid fire multiplier scales local gun cooldowns and ragebot intervals. Frame rate and server cooldowns limit the actual firing rate.")
     tabs["Viewmodel"]:CreateLabel("Weapons share the world camera. Zoom uses a local depth approximation rather than an independent camera FOV.")
     tabs["Cosmetic Preview"]:CreateLabel("Client inventory previews do not grant server ownership or purchases.")
     statusTab:CreateButton({Name="Show unavailable features",Callback=function()
@@ -2314,6 +2341,9 @@ local function installFeaturePack(window, Rayfield, player, endpoints)
     end})
     local teleportQueued=environment.__JewHubTeleportQueues[teleportScope]==true
     onChange=function(key)
+        if key=="rapidFire" or key=="rapidMultiplier" then
+            safe("Rapid fire",weaponStats)
+        end
         if key=="hitSound" and state.hitSound~="Off" and not feedback then problem("Hit sound","No supported local hit-feedback method was found") end
         if key=="resumeTeleport" then
             local queue=queue_on_teleport or (syn and syn.queue_on_teleport)
